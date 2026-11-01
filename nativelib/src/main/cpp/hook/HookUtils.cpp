@@ -338,6 +338,11 @@ size_t findSymbolInLibArt(const char * soname,const char * symname)
             break;
         }
         sym = (Elf64_Sym *)((size_t)symstart + idx * 0x18);
+        //跳过导入(未定义)符号，否则可能拿到st_value为0或无效的地址
+        if(sym->st_shndx == SHN_UNDEF)
+        {
+            continue;
+        }
         char* sname = (char*)((size_t)elf + strtab->d_un.d_val + sym->st_name);
         if(!strcmp(sname,symname))
         {

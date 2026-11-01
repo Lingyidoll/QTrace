@@ -5,6 +5,7 @@
 #include "dlfcn.h"
 #include "logger.h"
 #include "HookUtils.h"
+#include "TraceUtils.h"
 LibcTraceMap* _g_libc_trace = nullptr;
 static bool debug = false;
 
@@ -56,6 +57,80 @@ void addLibctrace(void* handle,TraceCallBack callback,const char* funcname)
     _g_libc_trace->map[addr] = func_trace;
     LOGE("libc trace: %s:%p install",funcname,(void*)addr);
 }
+/* 参数按C字符串输出: "xxx"，读不到时输出原始地址 */
+static void appendCStringArg(uint64_t addr)
+{
+    if (addr == 0)
+    {
+        appendlog("NULL");
+        return;
+    }
+    const size_t kMaxLen = 96;
+    size_t chunkList[] = {kMaxLen + 1, 33, 17};
+    for (size_t c = 0; c < sizeof(chunkList) / sizeof(chunkList[0]); ++c)
+    {
+        uint8_t raw[128] = {0};
+        size_t len = chunkList[c];
+        if (len > sizeof(raw))
+        {
+            len = sizeof(raw);
+        }
+        if (!safeReadMemory(addr, raw, len))
+        {
+            continue;
+        }
+        bool terminated = false;
+        bool printable = true;
+        size_t i = 0;
+        for (; i < len; ++i)
+        {
+            if (raw[i] == 0)
+            {
+                terminated = true;
+                break;
+            }
+            if (raw[i] < 0x20 || raw[i] > 0x7e)
+            {
+                printable = false;
+                break;
+            }
+        }
+        if (terminated && printable)
+        {
+            if (i > kMaxLen)
+            {
+                i = kMaxLen;
+            }
+            char buf[128] = {0};
+            memcpy(buf, raw, i);
+            appendformat("\"%s\"", buf);
+            return;
+        }
+    }
+    appendformat("0x%lx", addr);
+}
+
+void libc_strcmp(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    uint64_t x0 = QBDI_GPR_GET(gprState, 0);
+    uint64_t x1 = QBDI_GPR_GET(gprState, 1);
+    if(debug)
+    {
+        LOGE("libc strcmp:%p,%p",(void*)x0,(void*)x1);
+    }
+    appendlog("strcmp(");
+    appendCStringArg(x0);
+    appendlog(", ");
+    appendCStringArg(x1);
+    appendlog(")");
+    appendlogendl();
+}
+
 void libc_memmove(QBDI::VM *vm, QBDI::GPRState *gprState)
 {
     if(_logger == nullptr)

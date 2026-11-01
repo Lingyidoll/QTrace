@@ -34,5 +34,6 @@ void libc_exit(QBDI::VM *vm, QBDI::GPRState *gprState);
 void enable_libc_trace_debug(bool enable);
 void libc_strlen(QBDI::VM *vm, QBDI::GPRState *gprState);
 void libc_memset(QBDI::VM *vm, QBDI::GPRState *gprState);
+void libc_strcmp(QBDI::VM *vm, QBDI::GPRState *gprState);
 
 #endif //QBDI_LIBCTRACE_H

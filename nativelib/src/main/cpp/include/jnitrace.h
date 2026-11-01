@@ -12,6 +12,8 @@ extern const JNINativeInterface* pJFunc;
 extern JNIEnv * jniEnv;
 void initJni();
 void setup_jfunc(JNIEnv * jnienv);
+/* 由外部(frida)直接传入JNIEnv，避免符号查找拿到无效地址 */
+int setup_jni_env(void* env);
 void enable_jni_trace_debug(bool enable);
 
 struct JNITraceMap {

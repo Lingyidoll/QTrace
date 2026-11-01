@@ -1,16 +1,12 @@
 #include <jni.h>
-#include <string>
-#include <iostream>
-#include <cstdio>
 #include <dlfcn.h>
-#include <fstream>
-#include <unistd.h>
+#include <mutex>
 #include "vm.h"
 #include "HookUtils.h"
 #include "qbdihook.h"
 #include "jnitrace.h"
 #include "libctrace.h"
-#include "shadowhook.h"
+#include "lingyi_vm.h"
 using namespace std;
 
 static void addHooks()
@@ -37,6 +33,7 @@ static void addLibctrace()
     addLibctrace(handle,libc_execve,"execve");
     addLibctrace(handle,libc_clock_gettime,"clock_gettime");
     addLibctrace(handle,libc_strlen,"strlen");
+    addLibctrace(handle,libc_strcmp,"strcmp");
     addLibctrace(handle,libc_memmove,"memmove");
     addLibctrace(handle,libc_memset,"memset");
     addLibctrace(handle,libc_kill,"kill");
@@ -47,6 +44,12 @@ static void addLibctrace()
 
 static void addJNItrace()
 {
+    //initJni失败时pJFunc为空，直接解引用会崩溃，这里必须判空
+    if(pJFunc == nullptr)
+    {
+        LOGE("jni trace disabled: pJFunc is null");
+        return;
+    }
     addJNITrace((void*)pJFunc->NewStringUTF,"NewStringUTF",trace_NewStringUTF);
     addJNITrace((void*)pJFunc->GetStringUTFChars,"GetStringUTFChars",trace_GetStringUTFChars);
     addJNITrace((void*)pJFunc->NewString,"NewString",trace_NewString);
@@ -64,29 +67,13 @@ static void addJNItrace()
     addJNITrace((void*)pJFunc->GetByteArrayElements,"GetByteArrayElements",trace_GetByteArrayElements);
 }
 
-/* trace的so的名称*/
-string libname;
+/* trace环境初始化：只会在第一次调用 lingyi_vm_init / lingyi_vm_call 时执行一次 */
+static std::once_flag g_trace_init_flag;
 
-/* 将原始so放在手机的一个目录中，方便FQ读取,
- * FQ将通过这个so文p定位内存中目标so的位置'
- * 因为在maps中的so文件名不总是原始的so名，例如config.arm64_v8a.apk这种
- * */
-const char* libdir = "/data/local/tmp/";
-string libpath;
-/*需要trace的函数地址*/
-size_t trace_func = 0;
-
-void config()
+static void initTraceEnv()
 {
-    libname = "libtiny.so";
-
-    string localdir(libdir);
-    libpath = localdir + libname;
-
-    trace_func = 0x173148;
-
     //trace buffer 累计多少字节往本地写一次。设置为0表示每trace一条指令就写入本地
-    setBufferSize(0x10000000);//每16M写一次
+    setBufferSize(0x10000000);//每256M写一次
 
     //是否开启逐指令日志，每条指令trace都会输出在logcat中，数据量巨大，用于调试时使用。
     enableDebugInsn(false);
@@ -96,19 +83,6 @@ void config()
 
     //是否开启libc trace 日志，可在logcat中查看libc调用
     enable_libc_trace_debug(true);
-
-}
-
-void init_shadowhook()
-{
-    shadowhook_init(SHADOWHOOK_MODE_UNIQUE, true);
-    shadowhook_set_debuggable(true);
-}
-
-void trace()
-{
-    /*trace 配置*/
-    config();
 
     /*JNI Trace*/
     initJni();
@@ -124,35 +98,63 @@ void trace()
     initHookData();
     //添加目标so的hook点位
     addHooks();
-
-    auto soinfo = getSoBaseAddress(libpath.c_str(),libname.c_str());
-    if(soinfo.start != 0)
-    {
-        _g_trace_data = new g_trace_data();
-        _g_trace_data->base = soinfo.start;
-        _g_trace_data->start = soinfo.start;
-        _g_trace_data->end = soinfo.start + soinfo.size;
-        _g_trace_data->target = trace_func;
-        _g_trace_data->hooktask = shadowhook_hook_func_addr((void*)(_g_trace_data->start + _g_trace_data->target),
-                                                            (void*)(hook_and_trace_arg8),
-                                                            (void**)&ori_arg8);
-    }
-    else
-    {
-        LOGE("fail to load %s",libname.c_str());
-    }
 }
 
-void test()
+/*
+ * 只初始化trace环境（JNI/libc/自定义hook表），不执行trace。
+ * 用于把"环境初始化"和"QBDI执行目标函数"两步分开排查，frida可直接调用。
+ * @return 0 表示初始化流程执行完成
+ */
+extern "C" __attribute__((visibility("default")))
+int lingyi_vm_init(void)
 {
-    char value[16];
-    memset(value,0x10,1);
-    int res =  __system_property_get("ro.secure",value);
-    LOGE("ro.secure:%d,%s",res,value);
+    LOGI("lingyi_vm_init enter");
+    std::call_once(g_trace_init_flag, initTraceEnv);
+    LOGI("lingyi_vm_init done");
+    return 0;
 }
 
+/*
+ * 由frida把JNIEnv直接传给QTrace，绕开设备上 JNI_GetCreatedJavaVMs 找不到/地址无效的问题。
+ * frida侧：lingyi_vm_set_jnienv(Java.vm.getEnv().handle)，建议在 lingyi_vm_call 之前调用。
+ * @return 0 成功，-1 失败
+ */
+extern "C" __attribute__((visibility("default")))
+int lingyi_vm_set_jnienv(void *jni_env)
+{
+    if (setup_jni_env(jni_env) != 0)
+    {
+        return -1;
+    }
+    //如果initTraceEnv里JNI没初始化成功，这里补装JNI trace
+    addJNItrace();
+    LOGI("lingyi_vm_set_jnienv done,env:%p", jni_env);
+    return 0;
+}
+
+/*
+ * 对外导出的trace接口，frida可以直接调用（不再依赖shadowhook inline hook）：
+ *   var vmCall = new NativeFunction(addr, 'pointer',
+ *              ['pointer','pointer','uint32','pointer','uint32']);
+ *   var ret = vmCall(targetFunc, argsPtr, argNum, logPathPtr, 0);
+ */
+extern "C" __attribute__((visibility("default")))
+size_t lingyi_vm_call(void *func_addr, size_t *args, uint32_t arg_num, const char *log_path, uint32_t flags)
+{
+    std::call_once(g_trace_init_flag, initTraceEnv);
+
+    if (flags != LINGYI_VM_FLAG_NONE)
+    {
+        LOGW("lingyi_vm_call: flags(0x%x) is reserved, ignored", flags);
+    }
+
+    LOGI("lingyi_vm_call target:%p,arg_num:%u,log:%s", func_addr, arg_num,
+         log_path != nullptr ? log_path : "default");
+
+    return trace_call(func_addr, args, arg_num, log_path);
+}
+
+// no auto trace after injection, call lingyi_vm_call from frida
 __unused __attribute__((constructor)) void init_main() {
-    LOGE("Injected!");
-    init_shadowhook();
-    trace();
+    LOGE("Injected! call lingyi_vm_call to start trace");
 }

@@ -27,6 +27,8 @@ struct logger{
 extern logger *_logger;
 
 void initLogger(size_t function_address);
+/* 使用调用方指定的日志路径初始化logger，log_path为空时退化为默认路径 */
+void initLoggerWithPath(const char* log_path, size_t function_address);
 void deleteLogger();
 void writelog();
 void appendlog(const char* str);

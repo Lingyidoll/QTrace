@@ -7,12 +7,10 @@ project("nativelib")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_ANDROID_ARCH_ABI arm64-v8a)
 set(QBDI_ROOT ${CMAKE_SOURCE_DIR}/qbdi-arm64)
-set(SHADOWHOOK_ROOT ${CMAKE_SOURCE_DIR}/shadowhook)
 
 include_directories(
     # 项目头文件
     include hook raw_syscall third
-    ${SHADOWHOOK_ROOT}/include
     ${QBDI_ROOT}/include
 )
 
@@ -26,10 +24,6 @@ SET_OPTION(Plugin.Android.BionicLinkerUtil ON)
 # QBDI
 add_library(qbdi-arm64 STATIC IMPORTED)
 set_target_properties(qbdi-arm64 PROPERTIES IMPORTED_LOCATION ${QBDI_ROOT}/lib/libQBDI.a)
-
-# shadowhook
-add_library(shadowhook STATIC IMPORTED)
-set_target_properties(shadowhook PROPERTIES IMPORTED_LOCATION ${SHADOWHOOK_ROOT}/lib/libshadowhook.a)
 
 # ========================================================================================
 # 源文件配置
@@ -59,7 +53,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-stack-protector")
 # 链接库
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
     # 主要框架
-    qbdi-arm64 shadowhook
+    qbdi-arm64
     # 系统库
     android log
 )

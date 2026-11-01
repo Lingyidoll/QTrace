@@ -12,7 +12,11 @@
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <dlfcn.h>
+#include <mutex>
+#include <cstdarg>
 #include <QBDI/Callback.h>
+#include "QBDI/Memory.h"
 #include "vm.h"
 #include "logger.h"
 #include "qbdihook.h"
@@ -21,14 +25,15 @@
 #include "TraceLogger.h"
 #include "TraceUtils.h"
 #include "HookUtils.h"
-#include "shadowhook.h"
 using namespace std;
 using namespace QBDI;
-g_trace_data* _g_trace_data = nullptr;
+
+/* trace过程中使用的模块信息，jni/libc trace回调通过它计算模块内偏移 */
+static g_trace_data g_trace_data_storage{};
+g_trace_data* _g_trace_data = &g_trace_data_storage;
+size_t g_deferred_call_retval = 0;
 int bufsize = 0x1000000;
 bool debugInsn = false;
-
-func_arg_8 ori_arg8{};
 
 
 void setBufferSize(int size)
@@ -41,126 +46,253 @@ void enableDebugInsn(bool enable)
     debugInsn = enable;
 }
 
-void sync_regs(size_t* regs, size_t pc,QBDI::GPRState* qbdi_state)
-{
-    for(int i=0;i<31;i++)
-    {
-        QBDI_GPR_SET(qbdi_state,i,regs[i]);
-    }
-    qbdi_state->pc = pc;
-}
-
 static inline uintptr_t get_current_sp() {
     uintptr_t sp;
     __asm__ __volatile__("mov %0, sp" : "=r"(sp)); // 读取SP寄存器到sp变量
     return sp;
 }
 
-uintptr_t inline get_current_x30() {
-    uintptr_t reg;
-    __asm__ __volatile__("mov %0, x30" : "=r"(reg));
-    return reg;
-}
+// 一条指令涉及的寄存器：写寄存器输出 before -> after，读寄存器输出当前值
+struct RegRec {
+    int      idx;
+    bool     write;
+    uint64_t before;
+    uint64_t forceAfter;   // 非0时直接作为after（如bl/blr里的LR=返回地址）
+    char     name[8];
+};
+
 // pending:暂存上一条指令待补全的信息
 struct PendingInst {
     bool valid = false;
-    char line[256];
+    char line[512];          // "0x地址\t0x偏移\t\t助记符\t操作数\t"
     int  lineLen = 0;
-    int  writeRegs[8];
-    const char* writeNames[8];
-    int  numWrite = 0;
+    RegRec regs[16];
+    int  numRegs = 0;
     char memInfo[1024];      // 内存访问行(可能多条)
     int  memLen = 0;
+    char callHead[512];      // Call addr / Entering system lib
+    int  callHeadLen = 0;
+    char callTail[256];      // Return to
+    int  callTailLen = 0;
+    TraceCallBack deferredCb = nullptr;  // jni/libc trace回调，延迟到调用行之后执行
+    QBDI::GPRState snapshot{};           // 调用前的寄存器快照
+    bool hasSnapshot = false;
 };
 
 static PendingInst pending;
 
+// 记录一个寄存器，同一个寄存器只保留一条（读+写合并为写）
+static void appendRegRec(const char *name, int idx, uint64_t value, bool write, uint64_t forceAfter)
+{
+    if (name == nullptr)
+    {
+        return;
+    }
+    for (int i = 0; i < pending.numRegs; ++i)
+    {
+        if (pending.regs[i].idx == idx)
+        {
+            if (write)
+            {
+                pending.regs[i].write = true;
+                pending.regs[i].forceAfter = forceAfter;
+            }
+            return;
+        }
+    }
+    if (pending.numRegs >= (int)(sizeof(pending.regs) / sizeof(pending.regs[0])))
+    {
+        return;
+    }
+    RegRec &r = pending.regs[pending.numRegs++];
+    r.idx = idx;
+    r.write = write;
+    r.before = value;
+    r.forceAfter = forceAfter;
+    snprintf(r.name, sizeof(r.name), "%s", name);
+}
+
 // 把 pending(上一条指令)用当前寄存器状态补全并输出
-static void flushPending(QBDI::GPRState *gprState)
+static void flushPending(QBDI::VM *vm, QBDI::GPRState *gprState)
 {
     if (!pending.valid) return;
 
-    appendlog_n(pending.line, pending.lineLen);   // 上一条的 "asm [读]"
+    // 指令行: "0x地址\t0x偏移\t\t助记符\t操作数\t"
+    appendlog_n(pending.line, pending.lineLen);
 
-    if (pending.numWrite > 0) {
-        char wbuf[256];
+    // 寄存器: X1=0xold -> 0xnew, SP=0x...
+    if (pending.numRegs > 0) {
+        char wbuf[512];
         int woff = 0;
-        for (int i = 0; i < pending.numWrite; ++i) {
-            uint64_t v = QBDI_GPR_GET(gprState, pending.writeRegs[i]);  // 此刻 = 上一条执行后的值
-            woff += snprintf(wbuf + woff, sizeof(wbuf) - woff, "%s=0x%" PRIx64 " ",
-                             pending.writeNames[i], v);
+        for (int i = 0; i < pending.numRegs; ++i) {
+            RegRec &r = pending.regs[i];
+            uint64_t after = r.forceAfter != 0 ? r.forceAfter : QBDI_GPR_GET(gprState, r.idx);
+            int n;
+            if (r.write && r.before != after) {
+                n = snprintf(wbuf + woff, sizeof(wbuf) - woff, "%s%s=0x%" PRIx64 " -> 0x%" PRIx64,
+                             i ? ", " : "", r.name, r.before, after);
+            } else {
+                n = snprintf(wbuf + woff, sizeof(wbuf) - woff, "%s%s=0x%" PRIx64,
+                             i ? ", " : "", r.name, r.write ? after : r.before);
+            }
+            if (n < 0) { woff = 0; break; }
+            woff += n;
             if (woff >= (int)sizeof(wbuf)) { woff = sizeof(wbuf) - 1; break; }
         }
-        appendlog("\t => [");
+        appendlog(";");
         appendlog_n(wbuf, woff);
-        appendlog("]");
     }
     appendlogendl();
     if (pending.memLen > 0) {
         appendlog_n(pending.memInfo, pending.memLen);
     }
+    if (pending.callHeadLen > 0) {
+        appendlog_n(pending.callHead, pending.callHeadLen);
+    }
+    // jni/libc trace回调放在调用行之后执行，保证 "Call addr / 参数 / Return to" 的顺序
+    if (pending.deferredCb != nullptr) {
+        // 回调在调用返回之后执行，x0此时是调用返回值
+        g_deferred_call_retval = (size_t)QBDI_GPR_GET(gprState, QBDI::REG_RETURN);
+        pending.deferredCb(vm, pending.hasSnapshot ? &pending.snapshot : gprState);
+    }
+    if (pending.callTailLen > 0) {
+        appendlog_n(pending.callTail, pending.callTailLen);
+        appendlogendl();
+    }
     pending.valid = false;
 }
-static void save_regs(size_t* regs)
+
+/*
+ * 定位地址所属的ELF模块。
+ * 优先使用dladdr：部分加固so会被重命名，或者内嵌在apk中被直接mmap，
+ * 此时/proc/self/maps里的路径不可靠，dladdr可以拿到正确的模块基址；
+ * maps解析只用来补全模块结束地址。
+ */
+static MapItemInfo resolveModuleInfo(void *address)
 {
-    regs[0] = get_current_x0();
-    regs[1] = get_current_x1();
-    regs[2] = get_current_x2();
-    regs[3] = get_current_x3();
-    regs[4] = get_current_x4();
-    regs[5] = get_current_x5();
-    regs[6] = get_current_x6();
-    regs[7] = get_current_x7();
-    regs[8] = get_current_x8();
-    regs[9] = get_current_x9();
-    regs[10] = get_current_x10();
-    regs[11] = get_current_x11();
-    regs[12] = get_current_x12();
-    regs[13] = get_current_x13();
-    regs[14] = get_current_x14();
-    regs[15] = get_current_x15();
-    regs[16] = get_current_x16();
-    regs[17] = get_current_x17();
-    regs[18] = get_current_x18();
-    regs[19] = get_current_x19();
-    regs[20] = get_current_x20();
-    regs[21] = get_current_x21();
-    regs[22] = get_current_x22();
-    regs[23] = get_current_x23();
-    regs[24] = get_current_x24();
-    regs[25] = get_current_x25();
-    regs[26] = get_current_x26();
-    regs[27] = get_current_x27();
-    regs[28] = get_current_x28();
-    regs[29] = get_current_x29();
-    regs[30] = get_current_x30();
+    MapItemInfo info{0, 0};
+    Dl_info dl_info{};
+    if (dladdr(address, &dl_info) != 0 && dl_info.dli_fbase != nullptr)
+    {
+        info.start = reinterpret_cast<size_t>(dl_info.dli_fbase);
+    }
+    MapItemInfo maps_info = getSoBaseAddressFromAddress(address);
+    if (info.start == 0)
+    {
+        info.start = maps_info.start;
+    }
+    info.end = maps_info.end > info.start ? maps_info.end : 0;
+    info.size = info.end > info.start ? info.end - info.start : 0;
+    return info;
 }
 
-size_t trace(size_t regs[31])
+/* 获取地址所在的可执行映射段，作为模块解析失败时的兜底instrument范围 */
+static bool getExecRangeOfAddr(size_t addr, size_t &start, size_t &end)
 {
-    size_t function_address = _g_trace_data->start + _g_trace_data->target;
-    LOGE("start trace:%p",(void*)function_address);
-    shadowhook_unhook(_g_trace_data->hooktask);
+    size_t count = 0;
+    qbdi_MemoryMap *maps = qbdi_getCurrentProcessMaps(false, &count);
+    if (maps == nullptr)
+    {
+        return false;
+    }
+    bool found = false;
+    for (size_t i = 0; i < count; i++)
+    {
+        if ((maps[i].permission & QBDI_PF_EXEC) != 0 &&
+            addr >= (size_t)maps[i].start && addr < (size_t)maps[i].end)
+        {
+            start = (size_t)maps[i].start;
+            end = (size_t)maps[i].end;
+            found = true;
+            break;
+        }
+    }
+    qbdi_freeMemoryMapArray(maps, count);
+    return found;
+}
+
+// trace使用全局的logger/pending/disassemble缓存，这里串行化，
+// 同时禁止同一线程重入，避免trace状态被破坏
+static std::mutex g_trace_mutex;
+static thread_local bool g_tracing = false;
+
+size_t trace_call(void *func_addr, const size_t *args, size_t arg_num, const char *log_path)
+{
+    LOGE("trace_call enter:%p,arg_num:%zu,log:%s", func_addr, arg_num,
+         log_path != nullptr ? log_path : "default");
+    if (func_addr == nullptr)
+    {
+        LOGE("trace_call: target function is null");
+        return 0;
+    }
+    if (args == nullptr && arg_num != 0)
+    {
+        LOGE("trace_call: args is null but arg_num is %zu", arg_num);
+        return 0;
+    }
+    if (arg_num > 8)
+    {
+        LOGE("trace_call: too many args(%zu), only 8 register args are supported", arg_num);
+        return 0;
+    }
+    if (g_tracing)
+    {
+        LOGE("trace_call: trace is already running in current thread, skip");
+        return 0;
+    }
+
+    size_t function_address = reinterpret_cast<size_t>(func_addr);
+    MapItemInfo soinfo = resolveModuleInfo(func_addr);
+    if (soinfo.start == 0)
+    {
+        LOGE("trace_call: fail to find the module of %p", func_addr);
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> lock(g_trace_mutex);
+    g_tracing = true;
+
+    _g_trace_data->base = soinfo.start;
+    _g_trace_data->start = soinfo.start;
+    _g_trace_data->end = soinfo.end;
+
+    //先创建日志文件：这样即使后面QBDI初始化/执行时崩溃，也能通过日志文件是否存在判断执行到了哪一步
+    initLoggerWithPath(log_path,function_address);
+    LOGE("start trace:%p,module:[%p-%p],log:%s", func_addr,
+         (void *)_g_trace_data->start, (void *)_g_trace_data->end,
+         _logger->logfile.c_str());
     struct timeval start, end;
     gettimeofday(&start, nullptr);
+
     vm* vm_ = new vm();
-    auto qvm = vm_->init(_g_trace_data->start,_g_trace_data->end);
+    auto qvm = vm_->init(_g_trace_data->base,function_address);
+    LOGE("vm init done");
     auto qbdi_state = qvm.getGPRState();
-    initLogger(function_address);
+    if (qbdi_state == nullptr)
+    {
+        LOGE("trace_call: get gpr state fail");
+        writelog();
+        deleteLogger();
+        delete vm_;
+        g_tracing = false;
+        return 0;
+    }
     vm_->base = _g_trace_data->base;
-    sync_regs(regs,function_address,qbdi_state);
     //在当前栈上开辟栈，不使用allocateVirtualStack，防止libart中Thread crash
     size_t sp = get_current_sp();
     size_t stack_size = 0x4000;
     QBDI_GPR_SET(qbdi_state, QBDI::REG_SP, sp - stack_size);
     QBDI_GPR_SET(qbdi_state, QBDI::REG_BP, QBDI_GPR_GET(qbdi_state, QBDI::REG_SP));
-    QBDI::rword qbdi_retval;
+    QBDI::rword qbdi_retval = 0;
     LOGE("trace begin");
-    bool qbdi_success = qvm.call(&qbdi_retval, (uint64_t)function_address);
+    //参数按AAPCS64约定通过x0~x7传入
+    bool qbdi_success = qvm.callA(&qbdi_retval, (QBDI::rword)function_address,
+                                  (uint32_t)arg_num,
+                                  reinterpret_cast<const QBDI::rword *>(args));
     LOGE("trace end");
-    flushPending(qbdi_state);
+    flushPending(nullptr, qbdi_state);
+    writelog();
     if (qbdi_success) {
-        writelog();
         LOGE("trace completed successfully %s",_logger->logfile.c_str());
     } else {
         LOGE("trace failed");
@@ -172,38 +304,16 @@ size_t trace(size_t regs[31])
     LOGI("trace time cost:%lds",elapsed_sec);
     deleteLogger();
     delete vm_;
-    return qbdi_retval;
-}
-
-size_t hook_and_trace_arg8(size_t x0,size_t x1,size_t x2,size_t x3,size_t x4,size_t x5,size_t x6,size_t x7)
-{
-    size_t regs[31] = {0};
-    save_regs(regs);
-    regs[0] = x0;
-    regs[1] = x1;
-    regs[2] = x2;
-    regs[3] = x3;
-    regs[4] = x4;
-    regs[5] = x5;
-    regs[6] = x6;
-    regs[7] = x7;
-    //根据参数过滤条件
-    /*if(x0 == 1)
-    {
-        return ori_arg8(x0,x1,x2,x3,x4,x5,x6,x7);
-    }
-    else
-    {*/
-        size_t result = trace(regs);
-        _g_trace_data->hooktask = shadowhook_hook_func_addr((void*)(_g_trace_data->start + _g_trace_data->target),
-                                                            (void*)(hook_and_trace_arg8),
-                                                            (void**)&ori_arg8);
-        return result;
-    //}
+    g_tracing = false;
+    return qbdi_success ? (size_t)qbdi_retval : 0;
 }
 
 bool checkAndCallHook(QBDI::VM *vm, QBDI::GPRState *gprState,size_t addr,size_t lastaddr)
 {
+    if(_g_hook_data == nullptr)
+    {
+        return false;
+    }
     auto it = _g_hook_data->hookMap.find(addr);
     if(it != _g_hook_data->hookMap.end())
     {
@@ -223,31 +333,117 @@ bool checkAndCallHook(QBDI::VM *vm, QBDI::GPRState *gprState,size_t addr,size_t 
     return false;
 }
 
-bool checkLibcTrace_pre(QBDI::VM *vm, QBDI::GPRState *gprState,size_t target)
+/* 查找目标地址对应的jni trace回调 */
+static TraceCallBack findJniCallback(size_t target)
 {
-    auto it = _g_libc_trace->map.find(target);
-    if(it != _g_libc_trace->map.end())
+    if(_g_jni_trace == nullptr)
     {
-        it->second->callback(vm,gprState);
-        return true;
+        return nullptr;
+    }
+    auto it = _g_jni_trace->map.find(target);
+    return it == _g_jni_trace->map.end() ? nullptr : it->second->callback;
+}
+
+/* 查找目标地址对应的libc trace回调 */
+static TraceCallBack findLibcCallback(size_t target)
+{
+    if(_g_libc_trace == nullptr)
+    {
+        return nullptr;
+    }
+    auto it = _g_libc_trace->map.find(target);
+    return it == _g_libc_trace->map.end() ? nullptr : it->second->callback;
+}
+
+/* 带长度保护的格式化追加 */
+static int appf(char* out, size_t size, int off, const char* fmt, ...)
+{
+    if (off < 0) off = 0;
+    if ((size_t)off >= size) return (int)size - 1;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(out + off, size - off, fmt, ap);
+    va_end(ap);
+    if (n < 0) return off;
+    return (off + n < (int)size) ? off + n : (int)size - 1;
+}
+
+/* 取模块短名: /apex/com.android.art/lib64/libart.so -> libart.so */
+static void moduleShortName(const char* path, char* buf, size_t size)
+{
+    if (path == nullptr || path[0] == '\0')
+    {
+        snprintf(buf, size, "unknown");
+        return;
+    }
+    const char* p = strrchr(path, '/');
+    snprintf(buf, size, "%s", p != nullptr ? p + 1 : path);
+}
+
+/* 是否是系统库 */
+static bool isSystemLibPath(const char* path)
+{
+    if (path == nullptr)
+    {
+        return false;
+    }
+    static const char* kSystemPrefix[] = {"/system/", "/apex/", "/vendor/", "/product/", "/odm/"};
+    for (size_t i = 0; i < sizeof(kSystemPrefix) / sizeof(kSystemPrefix[0]); ++i)
+    {
+        if (strncmp(path, kSystemPrefix[i], strlen(kSystemPrefix[i])) == 0)
+        {
+            return true;
+        }
     }
     return false;
 }
 
-bool checkJniCall_pre(QBDI::VM *vm, QBDI::GPRState *gprState,size_t target)
+/* 调用信息头部: Call addr + 符号 + 是否进入系统库 */
+static int buildCallHead(char* out, size_t size, uint64_t target)
 {
-    if(pJFunc == nullptr)
+    int off = 0;
+    Dl_info info{};
+    bool ok = (target != 0 && dladdr((void*)target, &info) != 0 && info.dli_fname != nullptr);
+    char mod[128] = "unknown";
+    if (ok)
     {
-        LOGE("checkJniCall,pJFunc not init");
-        return false;
+        moduleShortName(info.dli_fname, mod, sizeof(mod));
     }
-    auto it = _g_jni_trace->map.find(target);
-    if(it != _g_jni_trace->map.end())
+
+    off = appf(out, size, off, "Call addr: 0x%" PRIx64, target);
+    if (ok && info.dli_sname != nullptr)
     {
-        it->second->callback(vm,gprState);
-        return true;
+        off = appf(out, size, off, " %s", info.dli_sname);
     }
-    return false;
+    else if (ok)
+    {
+        off = appf(out, size, off, " [%s!0x%" PRIx64 "]", mod, target - (uint64_t)info.dli_fbase);
+    }
+    else
+    {
+        off = appf(out, size, off, " [unknown]");
+    }
+    off = appf(out, size, off, "\n");
+    if (ok && isSystemLibPath(info.dli_fname))
+    {
+        off = appf(out, size, off, "  -> Entering system lib: %s\n", mod);
+    }
+    return off;
+}
+
+/* 调用信息尾部: 返回到哪里 */
+static int buildCallTail(char* out, size_t size, QBDI::GPRState* gprState,
+                         uint64_t address, uint32_t instSize, bool isCall)
+{
+    // bl/blr的返回地址是下一条指令; br是跳转前的LR
+    uint64_t retAddr = isCall ? (address + instSize) : QBDI_GPR_GET(gprState, QBDI::REG_LR);
+    char mod[128] = "unknown";
+    Dl_info info{};
+    if (retAddr != 0 && dladdr((void*)retAddr, &info) != 0 && info.dli_fname != nullptr)
+    {
+        moduleShortName(info.dli_fname, mod, sizeof(mod));
+    }
+    return appf(out, size, 0, "  <- Return to: 0x%" PRIx64 " (%s)\n", retAddr, mod);
 }
 
 static size_t lastAddr = 0;
@@ -260,7 +456,7 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
     auto thiz = (class vm *)data;
 
     //上一条指令的信息全部拿到了，写入
-    flushPending(gprState);
+    flushPending(vm, gprState);
 
     // 获取当前指令的分析信息
     const QBDI::InstAnalysis *instAnalysis = vm->getInstAnalysis(QBDI::ANALYSIS_INSTRUCTION  | QBDI::ANALYSIS_OPERANDS);
@@ -279,103 +475,126 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
         disassemblecache.emplace(bytecode, disasm);
     }
 
-    bool hasCheck = false;
-    //执行前hook
-    hasCheck = checkAndCallHook(vm,gprState,(instAnalysis->address-thiz->base),(lastAddr - thiz->base));
+    // 自定义QBDI hook（按模块内偏移匹配）
+    checkAndCallHook(vm,gprState,(instAnalysis->address-thiz->base),(lastAddr - thiz->base));
 
-    if(!hasCheck)
-    {
-        //检查blr
-        if(instAnalysis->isCall && !strcmp(instAnalysis->mnemonic,"BLR"))
-        {
-            for (int i = 0; i < instAnalysis->numOperands; ++i)
-            {
-                auto op = instAnalysis->operands[i];
-                if (op.regAccess == QBDI::REGISTER_READ || op.regAccess == REGISTER_READ_WRITE)
-                {
-                    if (op.regCtxIdx != -1 && op.type == OPERAND_GPR && op.regCtxIdx != 31)
-                    {
-                        uint64_t regValue = QBDI_GPR_GET(gprState, op.regCtxIdx);
-                        hasCheck = checkJniCall_pre(vm,gprState,regValue);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if(!hasCheck)
-    {
-        //检查br
-        if(instAnalysis->isBranch && !strcmp(instAnalysis->mnemonic,"BR") && hasLibctrace())
-        {
-            for (int i = 0; i < instAnalysis->numOperands; ++i)
-            {
-                auto op = instAnalysis->operands[i];
-                if (op.regAccess == QBDI::REGISTER_READ || op.regAccess == REGISTER_READ_WRITE)
-                {
-                    if (op.regCtxIdx != -1 && op.type == OPERAND_GPR && op.regCtxIdx != 31)
-                    {
-                        uint64_t regValue = QBDI_GPR_GET(gprState, op.regCtxIdx);
-                        //br可能是libc调用，也可能是jni调用
-                        if(!checkLibcTrace_pre(vm,gprState,regValue))
-                        {
-                            checkJniCall_pre(vm,gprState,regValue);
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    int off = 0;
-    off += snprintf(pending.line + off, sizeof(pending.line) - off,
-                    "0x%lx: %s", (instAnalysis->address - thiz->base), disasm);
-
-    char rbuf[256];
-    int roff = 0;
-    bool any = false;
-    for (int i = 0; i < instAnalysis->numOperands; ++i)
-    {
-        auto& op = instAnalysis->operands[i];
-        if ((op.regAccess == QBDI::REGISTER_READ || op.regAccess == REGISTER_READ_WRITE)
-            && op.regCtxIdx != -1 && op.type == OPERAND_GPR)
-        {
-            uint64_t regValue = QBDI_GPR_GET(gprState, op.regCtxIdx);
-            roff += snprintf(rbuf + roff, sizeof(rbuf) - roff, "%s=0x%" PRIx64 " ",
-                             op.regName, regValue);
-            any = true;
-            if (roff >= (int)sizeof(rbuf)) { roff = sizeof(rbuf) - 1; break; }
-        }
-    }
-    if (any) {
-        off += snprintf(pending.line + off, sizeof(pending.line) - off, "\t[");
-        // 把读寄存器拼进 pending.line
-        int copyLen = roff;
-        if (off + copyLen >= (int)sizeof(pending.line)) copyLen = sizeof(pending.line) - off - 2;
-        if (copyLen > 0) { memcpy(pending.line + off, rbuf, copyLen); off += copyLen; }
-        off += snprintf(pending.line + off, sizeof(pending.line) - off, "]");
-    }
-
-    pending.lineLen = off;
-
-    // ④ 记录当前指令会写哪些寄存器,等下一条 PRE 来补值
-    pending.numWrite = 0;
-    for (int i = 0; i < instAnalysis->numOperands; ++i)
-    {
-        auto& op = instAnalysis->operands[i];
-        if ((op.regAccess == REGISTER_WRITE || op.regAccess == REGISTER_READ_WRITE)
-            && op.regCtxIdx != -1 && op.type == OPERAND_GPR)
-        {
-            if (pending.numWrite < 8) {
-                pending.writeRegs[pending.numWrite]  = op.regCtxIdx;
-                pending.writeNames[pending.numWrite] = op.regName;
-                pending.numWrite++;
-            }
-        }
-    }
+    pending.numRegs = 0;
     pending.memLen = 0;
+    pending.callHeadLen = 0;
+    pending.callTailLen = 0;
+    pending.deferredCb = nullptr;
+    pending.hasSnapshot = false;
+
+    // 收集寄存器: 写寄存器输出 before -> after, 读寄存器输出当前值
+    for (int i = 0; i < instAnalysis->numOperands; ++i)
+    {
+        auto& op = instAnalysis->operands[i];
+        if (op.type != OPERAND_GPR || op.regCtxIdx < 0 || op.regName == nullptr)
+        {
+            continue;
+        }
+        bool write = (op.regAccess == REGISTER_WRITE || op.regAccess == REGISTER_READ_WRITE);
+        bool read = (op.regAccess == REGISTER_READ || op.regAccess == REGISTER_READ_WRITE);
+        if (!write && !read)
+        {
+            continue;
+        }
+        uint64_t value = QBDI_GPR_GET(gprState, op.regCtxIdx);
+        //xzr/wzr是零寄存器，QBDI给出的序号是NZCV，这里强制为0
+        if (strcasecmp(op.regName, "XZR") == 0 || strcasecmp(op.regName, "WZR") == 0)
+        {
+            value = 0;
+        }
+        appendRegRec(op.regName, op.regCtxIdx, value, write, 0);
+    }
+
+    // 分支/调用指令: 目标地址、符号、返回地址
+    const char* mnemonic = instAnalysis->mnemonic != nullptr ? instAnalysis->mnemonic : "";
+    bool isBl  = (strcasecmp(mnemonic, "bl") == 0);
+    bool isBlr = (strcasecmp(mnemonic, "blr") == 0);
+    bool isBr  = (strcasecmp(mnemonic, "br") == 0);
+    bool isCall = isBl || isBlr;
+
+    if (isCall || isBr)
+    {
+        uint64_t target = 0;
+        bool hasTarget = false;
+        for (int i = 0; i < instAnalysis->numOperands && !hasTarget; ++i)
+        {
+            auto& op = instAnalysis->operands[i];
+            if (op.type == OPERAND_GPR && op.regCtxIdx >= 0 &&
+                (op.regAccess == REGISTER_READ || op.regAccess == REGISTER_READ_WRITE))
+            {
+                //blr/br的目标在寄存器里
+                target = QBDI_GPR_GET(gprState, op.regCtxIdx);
+                hasTarget = true;
+            }
+            else if (isBl && op.type == OPERAND_IMM)
+            {
+                //bl是直接调用: QBDI给出的立即数是指令条数(imm26)，需要符号扩展后还原成绝对地址
+                int64_t imm26 = ((int64_t)((uint64_t)op.value << 38)) >> 38;
+                target = (uint64_t)((int64_t)instAnalysis->address + (imm26 << 2));
+                hasTarget = true;
+            }
+        }
+
+        if (isCall)
+        {
+            //调用约定: SP为调用时的栈指针, LR写入返回地址
+            appendRegRec("SP", QBDI::REG_SP, QBDI_GPR_GET(gprState, QBDI::REG_SP), false, 0);
+            appendRegRec("LR", QBDI::REG_LR, QBDI_GPR_GET(gprState, QBDI::REG_LR), true,
+                         (uint64_t)instAnalysis->address + instAnalysis->instSize);
+        }
+
+        if (hasTarget)
+        {
+            //jni/libc的trace回调延迟到调用行之后执行，保证 "Call addr/参数/Return to" 的顺序
+            TraceCallBack cb = nullptr;
+            if (isBlr)
+            {
+                cb = findJniCallback(target);
+            }
+            else if (isBr)
+            {
+                cb = findLibcCallback(target);
+                if (cb == nullptr)
+                {
+                    cb = findJniCallback(target);
+                }
+            }
+
+            //只对"跨模块"的调用（进入系统库/其他so）或已注册的jni/libc函数打印Call信息；
+            //模块内部的bl/blr（含PLT前的本地跳转）只保留指令行，避免刷屏和无意义的[unknown]
+            Dl_info targetInfo{};
+            bool resolved = (target != 0 && dladdr((void*)target, &targetInfo) != 0 &&
+                             targetInfo.dli_fbase != nullptr);
+            bool outsideModule = resolved &&
+                                 (reinterpret_cast<uint64_t>(targetInfo.dli_fbase) != (uint64_t)thiz->base);
+
+            if (outsideModule || cb != nullptr)
+            {
+                pending.callHeadLen = buildCallHead(pending.callHead, sizeof(pending.callHead), target);
+                pending.callTailLen = buildCallTail(pending.callTail, sizeof(pending.callTail),
+                                                    gprState, instAnalysis->address,
+                                                    instAnalysis->instSize, isCall);
+            }
+            if (cb != nullptr)
+            {
+                pending.deferredCb = cb;
+                pending.snapshot = *gprState;
+                pending.hasSnapshot = true;
+            }
+        }
+    }
+
+    // 指令行: 绝对地址 \t 模块内偏移 \t\t 助记符 \t 操作数
+    size_t mnemLen = strcspn(disasm, " \t");
+    pending.lineLen = appf(pending.line, sizeof(pending.line), 0,
+                           "0x%" PRIx64 "\t0x%" PRIx64 "\t\t%.*s\t%s\t",
+                           (uint64_t)instAnalysis->address,
+                           (uint64_t)(instAnalysis->address - thiz->base),
+                           (int)mnemLen, disasm, disasm + mnemLen);
+
     pending.valid = true;
 
     if(sdslen(_logger->buf) > bufsize)
@@ -463,19 +682,26 @@ QBDI::VMAction showSyscall(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::FPRStat
     return QBDI::VMAction::CONTINUE;
 }
 
-QBDI::VM vm::init(size_t start,size_t end)
+QBDI::VM vm::init(size_t base,size_t target)
 {
     uint32_t cid;
     QBDI::GPRState *state;
     QBDI::VM qvm{};
     state = qvm.getGPRState();
     loadMemoryRanges();
-    assert(state != nullptr);
+    if(state == nullptr)
+    {
+        LOGE("init vm fail: gpr state is null");
+        return qvm;
+    }
     qvm.recordMemoryAccess(QBDI::MEMORY_READ_WRITE);
 
     //指令前hook
     cid = qvm.addCodeCB(QBDI::PREINST, showPreInstruction, this);
-    assert(cid != QBDI::INVALID_EVENTID);
+    if(cid == QBDI::INVALID_EVENTID)
+    {
+        LOGE("init vm fail: add preinst callback fail");
+    }
 
     //指令后hook
     //cid = qvm.addCodeCB(QBDI::POSTINST, showPostInstruction, this);
@@ -487,14 +713,34 @@ QBDI::VM vm::init(size_t start,size_t end)
 
     //读写trace
     cid = qvm.addMemAccessCB(MEMORY_READ_WRITE, showMemoryAccess, this);
-    assert(cid != QBDI::INVALID_EVENTID);
+    if(cid == QBDI::INVALID_EVENTID)
+    {
+        LOGE("init vm fail: add mem access callback fail");
+    }
 
-    bool ret = qvm.addInstrumentedModuleFromAddr(reinterpret_cast<QBDI::rword>(start));
+    bool ret = qvm.addInstrumentedModuleFromAddr(reinterpret_cast<QBDI::rword>(target));
+    if(!ret)
+    {
+        //部分被加固/重命名的so QBDI解析不到模块信息，退化到只instrument函数所在的执行段
+        size_t exec_start = 0;
+        size_t exec_end = 0;
+        if(getExecRangeOfAddr(target,exec_start,exec_end))
+        {
+            LOGE("addInstrumentedModuleFromAddr fail, instrument exec segment:[%p-%p]",
+                 (void*)exec_start,(void*)exec_end);
+            qvm.addInstrumentedRange(reinterpret_cast<QBDI::rword>(exec_start),
+                                     reinterpret_cast<QBDI::rword>(exec_end));
+            ret = true;
+        }
+    }
     if(!ret)
     {
         LOGE("init vm fail");
-        assert(ret == true);
     }
-    LOGE("init vm success");
+    else
+    {
+        LOGE("init vm success");
+    }
+    this->base = base;
     return qvm;
 }
