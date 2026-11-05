@@ -241,6 +241,174 @@ uintptr_t get_current_x29() {
     return reg;
 }
 
+size_t findSymbolInSo(const char * soname, const char * symname)
+{
+    if (soname == nullptr || symname == nullptr)
+    {
+        return (size_t)-1;
+    }
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (fp == nullptr)
+    {
+        LOGE("findSymbolInSo: open maps fail");
+        return (size_t)-1;
+    }
+    size_t start = 0;
+    char *line = nullptr;
+    size_t len = 0;
+    //先找到该so的ELF头所在映射（模块基址），r-x段不一定是基址
+    while (getline(&line, &len, fp) != -1)
+    {
+        if (strstr(line, soname) == nullptr)
+        {
+            continue;
+        }
+        size_t s = 0;
+        size_t e = 0;
+        char perms[8] = {0};
+        if (sscanf(line, "%lx-%lx %7s", &s, &e, perms) != 3 || s == 0)
+        {
+            continue;
+        }
+        Elf64_Ehdr *hdr = (Elf64_Ehdr *)s;
+        if (memcmp(hdr->e_ident, ELFMAG, SELFMAG) == 0)
+        {
+            start = s;
+            break;
+        }
+    }
+    free(line);
+    fclose(fp);
+    if (start == 0)
+    {
+        LOGE("findSymbolInSo: %s not found in maps", soname);
+        return (size_t)-1;
+    }
+
+    Elf64_Ehdr *elf = (Elf64_Ehdr *)start;
+    Elf64_Phdr *phdrStart = (Elf64_Phdr *)(start + elf->e_phoff);
+    Elf64_Phdr *dynPhdr = nullptr;
+    for (int i = 0; i < elf->e_phnum; ++i)
+    {
+        Elf64_Phdr *phdr = (Elf64_Phdr *)((size_t)phdrStart + (size_t)i * elf->e_phentsize);
+        if (phdr->p_type == PT_DYNAMIC)
+        {
+            dynPhdr = phdr;
+            break;
+        }
+    }
+    if (dynPhdr == nullptr)
+    {
+        LOGE("findSymbolInSo: PT_DYNAMIC not found in %s", soname);
+        return (size_t)-1;
+    }
+
+    //部分场景下dynamic里的地址已经重定位成绝对地址，这里做一次兼容判断
+    auto resolvePtr = [start](uint64_t v) -> size_t {
+        if (v == 0) return 0;
+        return v >= start ? (size_t)v : (size_t)(start + v);
+    };
+
+    Elf64_Dyn *dyn = (Elf64_Dyn *)(start + dynPhdr->p_vaddr);
+    size_t dynCount = dynPhdr->p_memsz / sizeof(Elf64_Dyn);
+    uint64_t strtabAddr = 0;
+    uint64_t symtabAddr = 0;
+    uint64_t hashAddr = 0;
+    uint64_t gnuHashAddr = 0;
+    size_t syment = sizeof(Elf64_Sym);
+    for (size_t i = 0; i < dynCount; ++i)
+    {
+        switch (dyn[i].d_tag)
+        {
+            case DT_STRTAB: strtabAddr = dyn[i].d_un.d_ptr; break;
+            case DT_SYMTAB: symtabAddr = dyn[i].d_un.d_ptr; break;
+            case DT_SYMENT: syment = dyn[i].d_un.d_val; break;
+            case DT_HASH:   hashAddr = dyn[i].d_un.d_ptr; break;
+            case DT_GNU_HASH: gnuHashAddr = dyn[i].d_un.d_ptr; break;
+            default: break;
+        }
+    }
+    if (strtabAddr == 0 || symtabAddr == 0 || syment == 0)
+    {
+        LOGE("findSymbolInSo: %s missing DT_STRTAB/DT_SYMTAB", soname);
+        return (size_t)-1;
+    }
+    size_t strtab = resolvePtr(strtabAddr);
+    size_t symtab = resolvePtr(symtabAddr);
+
+    //符号数量:优先DT_HASH的nchain，其次DT_GNU_HASH，最后用 strtab-symtab 估算
+    size_t symCount = 0;
+    if (hashAddr != 0)
+    {
+        uint32_t *hash = (uint32_t *)resolvePtr(hashAddr);
+        if (hash != nullptr)
+        {
+            symCount = hash[1];
+        }
+    }
+    if (symCount == 0 && gnuHashAddr != 0)
+    {
+        //GNU_HASH布局: nbuckets, symoffset, bloom_size, bloom_shift, bloom[], buckets[], chain[]
+        uint32_t *gnuHash = (uint32_t *)resolvePtr(gnuHashAddr);
+        if (gnuHash != nullptr)
+        {
+            uint32_t nbuckets = gnuHash[0];
+            uint32_t symoffset = gnuHash[1];
+            uint32_t bloomSize = gnuHash[2];
+            uint32_t *buckets = (uint32_t *)((uint8_t *)(gnuHash + 4) + (size_t)bloomSize * sizeof(Elf64_Xword));
+            uint32_t lastBucket = 0;
+            for (uint32_t i = 0; i < nbuckets; ++i)
+            {
+                if (buckets[i] > lastBucket)
+                {
+                    lastBucket = buckets[i];
+                }
+            }
+            if (lastBucket < symoffset)
+            {
+                symCount = symoffset;
+            }
+            else
+            {
+                uint32_t *chain = buckets + nbuckets;
+                uint32_t idx = lastBucket - symoffset;
+                //chain最低位为1表示该bucket链结束
+                while (idx < 0x100000 && (chain[idx] & 1u) == 0)
+                {
+                    ++idx;
+                }
+                symCount = (size_t)symoffset + idx + 1;
+            }
+        }
+    }
+    if (symCount == 0 && strtab > symtab)
+    {
+        symCount = (strtab - symtab) / syment;
+    }
+    if (symCount == 0 || symCount > 0x100000)
+    {
+        symCount = 0x100000;
+    }
+
+    for (size_t i = 1; i < symCount; ++i)
+    {
+        Elf64_Sym *sym = (Elf64_Sym *)(symtab + i * syment);
+        if (sym->st_shndx == SHN_UNDEF || sym->st_name == 0)
+        {
+            continue;
+        }
+        const char *sname = (const char *)(strtab + sym->st_name);
+        if (strcmp(sname, symname) == 0)
+        {
+            size_t addr = start + sym->st_value;
+            LOGE("findSymbolInSo: %s!%s = 0x%lx", soname, symname, addr);
+            return addr;
+        }
+    }
+    LOGE("findSymbolInSo: %s!%s not found", soname, symname);
+    return (size_t)-1;
+}
+
 size_t findSymbolInLibArt(const char * soname,const char * symname)
 {
     size_t start = 0;

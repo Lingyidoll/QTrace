@@ -16,6 +16,7 @@ typedef bool (*TraceFilter)(size_t regs[]);
 
 struct TraceFunc {
     TraceCallBack callback;
+    const char* name = nullptr;   // 注册时的函数名，供通用回调打印
 };
 
 class vm {
@@ -41,7 +42,14 @@ struct g_trace_data{
 extern g_trace_data* _g_trace_data;
 /* 最近一次延迟回调所对应调用的返回值(x0)，供jni/libc回调读取 */
 extern size_t g_deferred_call_retval;
+/* 最近一次延迟回调对应的函数名（注册时传入），供通用回调使用 */
+extern const char* g_deferred_call_name;
+/* 最近一次延迟回调所对应JNI调用的JNIEnv(x0)。
+ * JNI局部引用与线程/env绑定，解析obj/method时必须用它，不能用初始化时保存的其他线程env */
+extern void *g_deferred_call_env;
 extern int bufsize ;
+/* setBufferSize 低8位保存的配置状态，不参与写盘阈值计算 */
+extern int bufstate;
 extern bool debugInsn;
 void setBufferSize(int);
 void enableDebugInsn(bool);

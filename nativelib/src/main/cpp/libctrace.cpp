@@ -14,6 +14,12 @@ void enable_libc_trace_debug(bool enable)
     debug = enable;
 }
 
+/* 当前libc trace开关状态(由setBufferSize的bit3控制) */
+bool is_libc_trace_enabled()
+{
+    return debug;
+}
+
 void initLibcTrace()
 {
     _g_libc_trace = new LibcTraceMap();
@@ -38,11 +44,17 @@ void addLibctrace(void* handle,TraceCallBack callback,const char* funcname)
     size_t addr = (size_t)dlsym(handle,funcname);
     if(addr == 0)
     {
-        LOGE("libc trace : %s find fail",funcname);
-        return;
+        //bionic内部实现(如__strlen_aarch64)不一定在导出表里，回退到ELF动态符号表解析
+        addr = findSymbolInSo("libc.so", funcname);
+        if(addr == 0 || addr == (size_t)-1)
+        {
+            LOGE("libc trace : %s find fail",funcname);
+            return;
+        }
     }
     TraceFunc* func_trace = new TraceFunc();
     func_trace->callback = callback;
+    func_trace->name = funcname;
     if(_g_libc_trace == nullptr)
     {
         LOGE("libc trace : not init!");
@@ -110,6 +122,61 @@ static void appendCStringArg(uint64_t addr)
     appendformat("0x%lx", addr);
 }
 
+/* 追加缓冲区预览：可打印内容输出为字符串，否则输出前若干字节的hex */
+static void appendBufferPreview(uint64_t addr, uint64_t len, uint64_t maxLen)
+{
+    if (addr == 0)
+    {
+        appendlog("NULL");
+        return;
+    }
+    if (len == 0)
+    {
+        appendlog("\"\"");
+        return;
+    }
+    uint64_t n = len < maxLen ? len : maxLen;
+    uint8_t buf[64] = {0};
+    if (n > sizeof(buf))
+    {
+        n = sizeof(buf);
+    }
+    if (!safeReadMemory(addr, buf, n))
+    {
+        appendformat("0x%lx", addr);
+        return;
+    }
+    bool printable = true;
+    for (uint64_t i = 0; i < n; ++i)
+    {
+        if (buf[i] == 0)
+        {
+            n = i;
+            break;
+        }
+        if (buf[i] < 0x20 || buf[i] > 0x7e)
+        {
+            printable = false;
+            break;
+        }
+    }
+    if (printable)
+    {
+        appendlog("\"");
+        appendlog_n((const char*)buf, (size_t)n);
+        appendlog("\"");
+    }
+    else
+    {
+        appendformat("0x%lx[", addr);
+        for (uint64_t i = 0; i < n; ++i)
+        {
+            appendformat("%s%02x", i ? " " : "", buf[i]);
+        }
+        appendlog("]");
+    }
+}
+
 void libc_strcmp(QBDI::VM *vm, QBDI::GPRState *gprState)
 {
     if(_logger == nullptr)
@@ -131,6 +198,66 @@ void libc_strcmp(QBDI::VM *vm, QBDI::GPRState *gprState)
     appendlogendl();
 }
 
+void libc_strncmp(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    uint64_t x2 = QBDI_GPR_GET(gprState, 2);
+    appendlog("strncmp(");
+    appendCStringArg(QBDI_GPR_GET(gprState, 0));
+    appendlog(", ");
+    appendCStringArg(QBDI_GPR_GET(gprState, 1));
+    appendformat(", 0x%lx)", x2);
+    appendlogendl();
+}
+
+void libc_strstr(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    appendlog("strstr(");
+    appendCStringArg(QBDI_GPR_GET(gprState, 0));
+    appendlog(", ");
+    appendCStringArg(QBDI_GPR_GET(gprState, 1));
+    appendlog(")");
+    appendlogendl();
+}
+
+void libc_strcpy(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    uint64_t dst = QBDI_GPR_GET(gprState, 0);
+    appendformat("strcpy(dst=0x%lx, src=", dst);
+    appendCStringArg(QBDI_GPR_GET(gprState, 1));
+    appendlog(")");
+    appendlogendl();
+}
+
+void libc_strncpy(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    uint64_t dst = QBDI_GPR_GET(gprState, 0);
+    uint64_t n = QBDI_GPR_GET(gprState, 2);
+    appendformat("strncpy(dst=0x%lx, src=", dst);
+    appendCStringArg(QBDI_GPR_GET(gprState, 1));
+    appendformat(", len=0x%lx)", n);
+    appendlogendl();
+}
+
 void libc_memmove(QBDI::VM *vm, QBDI::GPRState *gprState)
 {
     if(_logger == nullptr)
@@ -141,27 +268,13 @@ void libc_memmove(QBDI::VM *vm, QBDI::GPRState *gprState)
     uint64_t x0 = QBDI_GPR_GET(gprState, 0);
     uint64_t x1 = QBDI_GPR_GET(gprState, 1);
     uint64_t x2 = QBDI_GPR_GET(gprState, 2);
-    bool bIsString = false;
-    if(x2 > 1)
+    if(debug)
     {
-        int len = x2 <= 10 ? x2:10;
-        bIsString = isString((char*)x1,len);
-        if(bIsString)
-        {
-            LOGE("libc memmove: %s",(char*)x1);
-        }
+        LOGE("libc memmove:%p,%p,%lx",(void*)x0,(void*)x1,x2);
     }
-    appendlogendl();
-    appendformat("[log] libc memmove: dest 0x%lx,src 0x%lx,len 0x%lx",x0,x1,x2);
-    if(bIsString)
-    {
-        appendformat(",%s;",(char*)x1);
-    }
-    else{
-        char* hex = bytes_to_hex_string((char*)x1,x2);
-        appendformat("\n%s;",hex);
-        free(hex);
-    }
+    appendformat("memmove(dst=0x%lx, src=", x0);
+    appendBufferPreview(x1, x2, 32);
+    appendformat(", len=0x%lx)", x2);
     appendlogendl();
 }
 
@@ -174,8 +287,7 @@ void libc_memset(QBDI::VM *vm, QBDI::GPRState *gprState) {
     uint64_t x0 = QBDI_GPR_GET(gprState, 0);
     uint64_t x1 = QBDI_GPR_GET(gprState, 1);
     uint64_t x2 = QBDI_GPR_GET(gprState, 2);
-    appendlogendl();
-    appendformat("libc memset:addr:%p,val:%x,num:%x",x0,x1,x2);
+    appendformat("memset(addr=0x%lx, val=0x%lx, num=0x%lx)", x0, x1, x2);
     appendlogendl();
 }
 
@@ -189,27 +301,23 @@ void libc_memcpy(QBDI::VM *vm, QBDI::GPRState *gprState)
     uint64_t x0 = QBDI_GPR_GET(gprState, 0);
     uint64_t x1 = QBDI_GPR_GET(gprState, 1);
     uint64_t x2 = QBDI_GPR_GET(gprState, 2);
-    bool bIsString = false;
-    if(x2 > 1)
-    {
-        int len = x2 <= 10 ? x2:10;
-        bIsString = isString((char*)x1,len);
-        if(bIsString)
-        {
-            LOGE("libc memcpy: %s",(char*)x1);
-        }
-    }
+    appendformat("memcpy(dst=0x%lx, src=", x0);
+    appendBufferPreview(x1, x2, 32);
+    appendformat(", len=0x%lx)", x2);
     appendlogendl();
-    appendformat("[log] libc memcpy: dest 0x%lx,src 0x%lx,len 0x%lx",x0,x1,x2);
-    if(bIsString)
+}
+
+void libc_memcmp(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
     {
-        appendformat(",%s;",(char*)x1);
+        LOGE("libc trace:logger not init!");
+        return;
     }
-    else{
-        char* hex = bytes_to_hex_string((char*)x1,x2);
-        appendformat("\n%s;",hex);
-        free(hex);
-    }
+    appendformat("memcmp(a=0x%lx, b=0x%lx, len=0x%lx)",
+                 QBDI_GPR_GET(gprState, 0),
+                 QBDI_GPR_GET(gprState, 1),
+                 QBDI_GPR_GET(gprState, 2));
     appendlogendl();
 }
 
@@ -220,14 +328,9 @@ void libc_access(QBDI::VM *vm, QBDI::GPRState *gprState)
         LOGE("libc trace:logger not init!");
         return;
     }
-    uint64_t x0 = QBDI_GPR_GET(gprState, 0);
-    if(debug)
-    {
-        LOGE("libc access:%s",(char*)x0);
-    }
-    appendlogendl();
-    appendlog("[log] libc access:");
-    appendlog((char*)x0);
+    appendlog("access(path=");
+    appendCStringArg(QBDI_GPR_GET(gprState, 0));
+    appendformat(", mode=0x%lx)", QBDI_GPR_GET(gprState, 1));
     appendlogendl();
 }
 
@@ -235,17 +338,12 @@ void libc_system_property_get(QBDI::VM *vm, QBDI::GPRState *gprState)
 {
     if(_logger == nullptr)
     {
-        LOGE("qdbi hook:logger not init!");
+        LOGE("libc trace:logger not init!");
         return;
     }
-    uint64_t x0 = QBDI_GPR_GET(gprState, 0);
-    if(debug)
-    {
-        LOGE("libc _system_property_get:%s",(char*)x0);
-    }
-    appendlogendl();
-    appendlog("[log] libc _system_property_get:");
-    appendlog((char*)x0);
+    appendlog("__system_property_get(name=");
+    appendCStringArg(QBDI_GPR_GET(gprState, 0));
+    appendlog(")");
     appendlogendl();
 }
 
@@ -253,16 +351,27 @@ void libc_pthread_create(QBDI::VM *vm, QBDI::GPRState *gprState)
 {
     if(_logger == nullptr)
     {
-        LOGE("qdbi hook:logger not init!");
+        LOGE("libc trace:logger not init!");
         return;
     }
-    uint64_t x2 = QBDI_GPR_GET(gprState, 2);
+    uint64_t thread = QBDI_GPR_GET(gprState, 0);
+    uint64_t attr = QBDI_GPR_GET(gprState, 1);
+    uint64_t routine = QBDI_GPR_GET(gprState, 2);
+    uint64_t arg = QBDI_GPR_GET(gprState, 3);
     if(debug)
     {
-        LOGE("libc pthread_create:%lx",x2 - _g_trace_data->base);
+        LOGE("libc pthread_create:%lx", routine - _g_trace_data->base);
     }
-    appendlogendl();
-    appendformat("[log] libc pthread_create:%lx",x2 - _g_trace_data->base);
+    appendformat("pthread_create(thread=0x%lx, attr=0x%lx, start_routine=", thread, attr);
+    if(_g_trace_data != nullptr && routine >= _g_trace_data->base && routine < _g_trace_data->end)
+    {
+        appendformat("0x%lx(module+0x%lx)", routine, routine - _g_trace_data->base);
+    }
+    else
+    {
+        appendformat("0x%lx", routine);
+    }
+    appendformat(", arg=0x%lx)", arg);
     appendlogendl();
 }
 
@@ -272,9 +381,9 @@ void libc_clock_gettime(QBDI::VM *vm, QBDI::GPRState *gprState)
     {
         LOGE("libc clock_gettime");
     }
-    uint64_t x1 = QBDI_GPR_GET(gprState, 1);
-    appendlogendl();
-    appendformat("[log] libc clock_gettime:%p",x1);
+    appendformat("clock_gettime(clk_id=%ld, tp=0x%lx)",
+                 (long)(int32_t)(uint32_t)QBDI_GPR_GET(gprState, 0),
+                 QBDI_GPR_GET(gprState, 1));
     appendlogendl();
 }
 
@@ -284,8 +393,7 @@ void libc_exit(QBDI::VM *vm, QBDI::GPRState *gprState)
     {
         LOGE("libc exit");
     }
-    appendlogendl();
-    appendformat("[log] libc exit");
+    appendformat("exit(status=%d)", (int)(int32_t)(uint32_t)QBDI_GPR_GET(gprState, 0));
     appendlogendl();
 }
 
@@ -295,13 +403,21 @@ void libc_abort(QBDI::VM *vm, QBDI::GPRState *gprState)
     {
         LOGE("libc abort");
     }
-    appendlogendl();
-    appendformat("[log] libc abort");
+    appendlog("abort()");
     appendlogendl();
 }
 
 void libc_kill(QBDI::VM *vm, QBDI::GPRState *gprState)
 {
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    appendformat("kill(pid=%d, sig=%d)",
+                 (int)(int32_t)(uint32_t)QBDI_GPR_GET(gprState, 0),
+                 (int)(int32_t)(uint32_t)QBDI_GPR_GET(gprState, 1));
+    appendlogendl();
 }
 
 void libc_strlen(QBDI::VM *vm, QBDI::GPRState *gprState)
@@ -314,10 +430,11 @@ void libc_strlen(QBDI::VM *vm, QBDI::GPRState *gprState)
     uint64_t x0 = QBDI_GPR_GET(gprState, 0);
     if(debug)
     {
-        LOGE("libc strlen:%s",(char*)x0);
+        LOGE("libc strlen:%p",(void*)x0);
     }
-    appendlogendl();
-    appendformat("[log] libc strlen:%s",(char*)x0);
+    appendlog("strlen(");
+    appendCStringArg(x0);
+    appendlog(")");
     appendlogendl();
 }
 
@@ -328,22 +445,27 @@ void libc_execve(QBDI::VM *vm, QBDI::GPRState *gprState)
         LOGE("libc trace:logger not init!");
         return;
     }
-    uint64_t x0 = QBDI_GPR_GET(gprState, 0);
-    uint64_t x1 = QBDI_GPR_GET(gprState, 1);
-    if(debug)
+    uint64_t path = QBDI_GPR_GET(gprState, 0);
+    uint64_t argv = QBDI_GPR_GET(gprState, 1);
+    appendlog("execve(path=");
+    appendCStringArg(path);
+    appendlog(", argv=[");
+    //最多输出前8个参数，避免非法指针导致长时间循环
+    for (int i = 0; i < 8 && argv != 0; ++i, argv += sizeof(uint64_t))
     {
-        LOGE("libc execv:%s",(char*)x0);
-        while (true)
+        uint64_t arg = 0;
+        if (!safeReadMemory(argv, (uint8_t*)&arg, sizeof(arg)) || arg == 0)
         {
-            char* arg = *((char **)x1) ;
-            if(arg == nullptr)
-            {
-                break;
-            }
-            LOGE("[log] libc execv argv:%s",arg);
-            x1 += 8;
+            break;
         }
+        if (i)
+        {
+            appendlog(", ");
+        }
+        appendCStringArg(arg);
     }
+    appendlog("])");
+    appendlogendl();
 }
 
 void libc_fstatat(QBDI::VM *vm, QBDI::GPRState *gprState)
@@ -353,14 +475,9 @@ void libc_fstatat(QBDI::VM *vm, QBDI::GPRState *gprState)
         LOGE("libc trace:logger not init!");
         return;
     }
-    uint64_t x1 = QBDI_GPR_GET(gprState, 1);
-    if(debug)
-    {
-        LOGE("libc fstat:%s",(char*)x1);
-    }
-    appendlogendl();
-    appendlog("[log] libc fstat:");
-    appendlog((char*)x1);
+    appendformat("fstatat(dirfd=%d, path=", (int)(int32_t)(uint32_t)QBDI_GPR_GET(gprState, 0));
+    appendCStringArg(QBDI_GPR_GET(gprState, 1));
+    appendformat(", flags=0x%lx)", QBDI_GPR_GET(gprState, 3));
     appendlogendl();
 }
 
@@ -371,14 +488,9 @@ void libc_stat(QBDI::VM *vm, QBDI::GPRState *gprState)
         LOGE("libc trace:logger not init!");
         return;
     }
-    uint64_t x0 = QBDI_GPR_GET(gprState, 0);
-    if(debug)
-    {
-        LOGE("libc stat:%s",(char*)x0);
-    }
-    appendlogendl();
-    appendlog("[log] libc stat:");
-    appendlog((char*)x0);
+    appendlog("stat(path=");
+    appendCStringArg(QBDI_GPR_GET(gprState, 0));
+    appendlog(")");
     appendlogendl();
 }
 
@@ -389,14 +501,9 @@ void libc_lstat(QBDI::VM *vm, QBDI::GPRState *gprState)
         LOGE("libc trace:logger not init!");
         return;
     }
-    uint64_t x0 = QBDI_GPR_GET(gprState, 0);
-    if(debug)
-    {
-        LOGE("libc lstat:%s",(char*)x0);
-    }
-    appendlogendl();
-    appendlog("[log] libc lstat:");
-    appendlog((char*)x0);
+    appendlog("lstat(path=");
+    appendCStringArg(QBDI_GPR_GET(gprState, 0));
+    appendlog(")");
     appendlogendl();
 }
 
@@ -407,13 +514,135 @@ void libc_fopen(QBDI::VM *vm, QBDI::GPRState *gprState)
         LOGE("libc trace:logger not init!");
         return;
     }
-    uint64_t x0 = QBDI_GPR_GET(gprState, 0);
-    if(debug)
-    {
-        LOGE("libc fopen:%s",(char*)x0);
-    }
+    appendlog("fopen(path=");
+    appendCStringArg(QBDI_GPR_GET(gprState, 0));
+    appendlog(", mode=");
+    appendCStringArg(QBDI_GPR_GET(gprState, 1));
+    appendlog(")");
     appendlogendl();
-    appendlog("[log] libc fopen:");
-    appendlog((char*)x0);
+}
+
+/* ---------------- 常用内存/文件函数 ---------------- */
+
+void libc_malloc(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    appendformat("malloc(0x%lx)", QBDI_GPR_GET(gprState, 0));
+    appendlogendl();
+}
+
+void libc_free(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    appendformat("free(ptr=0x%lx)", QBDI_GPR_GET(gprState, 0));
+    appendlogendl();
+}
+
+void libc_calloc(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    appendformat("calloc(nmemb=0x%lx, size=0x%lx)",
+                 QBDI_GPR_GET(gprState, 0), QBDI_GPR_GET(gprState, 1));
+    appendlogendl();
+}
+
+void libc_realloc(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    appendformat("realloc(ptr=0x%lx, size=0x%lx)",
+                 QBDI_GPR_GET(gprState, 0), QBDI_GPR_GET(gprState, 1));
+    appendlogendl();
+}
+
+void libc_getenv(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    appendlog("getenv(name=");
+    appendCStringArg(QBDI_GPR_GET(gprState, 0));
+    appendlog(")");
+    appendlogendl();
+}
+
+void libc_open(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    appendlog("open(path=");
+    appendCStringArg(QBDI_GPR_GET(gprState, 0));
+    appendformat(", flags=0x%lx)", QBDI_GPR_GET(gprState, 1));
+    appendlogendl();
+}
+
+void libc_openat(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    appendformat("openat(dirfd=%d, path=", (int)(int32_t)(uint32_t)QBDI_GPR_GET(gprState, 0));
+    appendCStringArg(QBDI_GPR_GET(gprState, 1));
+    appendformat(", flags=0x%lx)", QBDI_GPR_GET(gprState, 2));
+    appendlogendl();
+}
+
+void libc_read(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    appendformat("read(fd=%d, buf=0x%lx, count=0x%lx)",
+                 (int)(int32_t)(uint32_t)QBDI_GPR_GET(gprState, 0),
+                 QBDI_GPR_GET(gprState, 1),
+                 QBDI_GPR_GET(gprState, 2));
+    appendlogendl();
+}
+
+void libc_write(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    appendformat("write(fd=%d, buf=", (int)(int32_t)(uint32_t)QBDI_GPR_GET(gprState, 0));
+    appendBufferPreview(QBDI_GPR_GET(gprState, 1), QBDI_GPR_GET(gprState, 2), 32);
+    appendformat(", count=0x%lx)", QBDI_GPR_GET(gprState, 2));
+    appendlogendl();
+}
+
+void libc_close(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    appendformat("close(fd=%d)", (int)(int32_t)(uint32_t)QBDI_GPR_GET(gprState, 0));
     appendlogendl();
 }

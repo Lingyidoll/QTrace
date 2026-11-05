@@ -54,6 +54,8 @@ char* getAppName();
 char* getPrivatePath();
 const char* getAddressInfo(void* address, char* buffer, size_t buffer_size);
 size_t findSymbolInLibArt(const char * soname,const char * symname);
+/* 通用ELF符号解析：在已加载的so中按名字查找导出/动态符号 */
+size_t findSymbolInSo(const char * soname, const char * symname);
 size_t getLibRXsize(const char * soname);
 size_t base64_encode(char *out, const uint8_t *data, size_t len) ;
 char* bytes_to_hex_string(char* bytes, size_t len) ;
