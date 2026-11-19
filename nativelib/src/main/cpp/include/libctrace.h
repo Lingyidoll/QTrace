@@ -53,5 +53,10 @@ void libc_openat(QBDI::VM *vm, QBDI::GPRState *gprState);
 void libc_read(QBDI::VM *vm, QBDI::GPRState *gprState);
 void libc_write(QBDI::VM *vm, QBDI::GPRState *gprState);
 void libc_close(QBDI::VM *vm, QBDI::GPRState *gprState);
+/* 内存映射 / 动态符号 / 字符串复制 */
+void libc_mmap(QBDI::VM *vm, QBDI::GPRState *gprState);
+void libc_munmap(QBDI::VM *vm, QBDI::GPRState *gprState);
+void libc_dlsym(QBDI::VM *vm, QBDI::GPRState *gprState);
+void libc_strdup(QBDI::VM *vm, QBDI::GPRState *gprState);
 
 #endif //QBDI_LIBCTRACE_H

@@ -58,10 +58,13 @@ static void addLibctrace()
     //bionic内部实现，dlsym找不到时addLibctrace会回退到ELF动态符号表解析
     addLibctrace(handle,libc_strlen,"__strlen_aarch64");
     addLibctrace(handle,libc_memset,"__memset_aarch64");
-    // TODO mmap
-    // todo munmap
-    // todo dlsym
-    // todo strdup
+    //内存映射 / 动态符号 / 字符串复制
+    addLibctrace(handle,libc_mmap,"mmap");
+    addLibctrace(handle,libc_munmap,"munmap");
+    addLibctrace(handle,libc_dlsym,"dlsym");
+    addLibctrace(handle,libc_strdup,"strdup");
+    // todo pthread_mutex_lock
+    // todo pthread_mutex_unlock
     dlclose(handle);
 }
 
@@ -142,68 +145,98 @@ static void addJNItrace()
 #define ADD_JNI_CALL_TRACE(fn) addJNITrace((void*)pJFunc->fn, #fn, trace_CallMethod)
     ADD_JNI_CALL_TRACE(CallObjectMethod);
     ADD_JNI_CALL_TRACE(CallObjectMethodV);
+    ADD_JNI_CALL_TRACE(CallObjectMethodA);
     ADD_JNI_CALL_TRACE(CallBooleanMethod);
     ADD_JNI_CALL_TRACE(CallBooleanMethodV);
+    ADD_JNI_CALL_TRACE(CallBooleanMethodA);
     ADD_JNI_CALL_TRACE(CallByteMethod);
     ADD_JNI_CALL_TRACE(CallByteMethodV);
+    ADD_JNI_CALL_TRACE(CallByteMethodA);
     ADD_JNI_CALL_TRACE(CallCharMethod);
     ADD_JNI_CALL_TRACE(CallCharMethodV);
+    ADD_JNI_CALL_TRACE(CallCharMethodA);
     ADD_JNI_CALL_TRACE(CallShortMethod);
     ADD_JNI_CALL_TRACE(CallShortMethodV);
+    ADD_JNI_CALL_TRACE(CallShortMethodA);
     ADD_JNI_CALL_TRACE(CallIntMethod);
     ADD_JNI_CALL_TRACE(CallIntMethodV);
+    ADD_JNI_CALL_TRACE(CallIntMethodA);
     ADD_JNI_CALL_TRACE(CallLongMethod);
     ADD_JNI_CALL_TRACE(CallLongMethodV);
+    ADD_JNI_CALL_TRACE(CallLongMethodA);
     ADD_JNI_CALL_TRACE(CallFloatMethod);
     ADD_JNI_CALL_TRACE(CallFloatMethodV);
+    ADD_JNI_CALL_TRACE(CallFloatMethodA);
     ADD_JNI_CALL_TRACE(CallDoubleMethod);
     ADD_JNI_CALL_TRACE(CallDoubleMethodV);
+    ADD_JNI_CALL_TRACE(CallDoubleMethodA);
     ADD_JNI_CALL_TRACE(CallVoidMethod);
     ADD_JNI_CALL_TRACE(CallVoidMethodV);
+    ADD_JNI_CALL_TRACE(CallVoidMethodA);
     ADD_JNI_CALL_TRACE(CallStaticObjectMethod);
     ADD_JNI_CALL_TRACE(CallStaticObjectMethodV);
+    ADD_JNI_CALL_TRACE(CallStaticObjectMethodA);
     ADD_JNI_CALL_TRACE(CallStaticBooleanMethod);
     ADD_JNI_CALL_TRACE(CallStaticBooleanMethodV);
+    ADD_JNI_CALL_TRACE(CallStaticBooleanMethodA);
     ADD_JNI_CALL_TRACE(CallStaticByteMethod);
     ADD_JNI_CALL_TRACE(CallStaticByteMethodV);
+    ADD_JNI_CALL_TRACE(CallStaticByteMethodA);
     ADD_JNI_CALL_TRACE(CallStaticCharMethod);
     ADD_JNI_CALL_TRACE(CallStaticCharMethodV);
+    ADD_JNI_CALL_TRACE(CallStaticCharMethodA);
     ADD_JNI_CALL_TRACE(CallStaticShortMethod);
     ADD_JNI_CALL_TRACE(CallStaticShortMethodV);
+    ADD_JNI_CALL_TRACE(CallStaticShortMethodA);
     ADD_JNI_CALL_TRACE(CallStaticIntMethod);
     ADD_JNI_CALL_TRACE(CallStaticIntMethodV);
+    ADD_JNI_CALL_TRACE(CallStaticIntMethodA);
     ADD_JNI_CALL_TRACE(CallStaticLongMethod);
     ADD_JNI_CALL_TRACE(CallStaticLongMethodV);
+    ADD_JNI_CALL_TRACE(CallStaticLongMethodA);
     ADD_JNI_CALL_TRACE(CallStaticFloatMethod);
     ADD_JNI_CALL_TRACE(CallStaticFloatMethodV);
+    ADD_JNI_CALL_TRACE(CallStaticFloatMethodA);
     ADD_JNI_CALL_TRACE(CallStaticDoubleMethod);
     ADD_JNI_CALL_TRACE(CallStaticDoubleMethodV);
+    ADD_JNI_CALL_TRACE(CallStaticDoubleMethodA);
     ADD_JNI_CALL_TRACE(CallStaticVoidMethod);
     ADD_JNI_CALL_TRACE(CallStaticVoidMethodV);
+    ADD_JNI_CALL_TRACE(CallStaticVoidMethodA);
 #undef ADD_JNI_CALL_TRACE
 
     //CallNonvirtual*Method 系列：参数布局不同(obj,clazz,methodID,...)
 #define ADD_JNI_NONVIRTUAL_TRACE(fn) addJNITrace((void*)pJFunc->fn, #fn, trace_CallNonvirtualMethod)
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualObjectMethod);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualObjectMethodV);
+    ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualObjectMethodA);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualBooleanMethod);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualBooleanMethodV);
+    ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualBooleanMethodA);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualByteMethod);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualByteMethodV);
+    ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualByteMethodA);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualCharMethod);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualCharMethodV);
+    ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualCharMethodA);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualShortMethod);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualShortMethodV);
+    ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualShortMethodA);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualIntMethod);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualIntMethodV);
+    ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualIntMethodA);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualLongMethod);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualLongMethodV);
+    ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualLongMethodA);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualFloatMethod);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualFloatMethodV);
+    ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualFloatMethodA);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualDoubleMethod);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualDoubleMethodV);
+    ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualDoubleMethodA);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualVoidMethod);
     ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualVoidMethodV);
+    ADD_JNI_NONVIRTUAL_TRACE(CallNonvirtualVoidMethodA);
 #undef ADD_JNI_NONVIRTUAL_TRACE
 
     //构造对象
@@ -291,7 +324,6 @@ static void addJNItrace()
     addJNITrace((void*)pJFunc->DefineClass,"DefineClass",trace_DefineClass);
     addJNITrace((void*)pJFunc->GetDirectBufferAddress,"GetDirectBufferAddress",trace_DirectBufferFunc);
     addJNITrace((void*)pJFunc->GetDirectBufferCapacity,"GetDirectBufferCapacity",trace_DirectBufferFunc);
-    // todo CallStaticObjectMethodA
 }
 
 /* trace环境初始化：只会在第一次调用 lingyi_vm_init / lingyi_vm_call 时执行一次 */
@@ -331,6 +363,71 @@ int lingyi_vm_set_jnienv(void *jni_env)
 }
 
 /*
+ * 只初始化 trace 环境（JNI/libc/hook 表），不执行 trace。
+ * 方便先单独调用一次确认 hook 安装与日志路径是否正常，再调用 lingyi_vm_call。
+ */
+extern "C" __attribute__((visibility("default")))
+int lingyi_vm_init(void)
+{
+    std::call_once(g_trace_init_flag, initTraceEnv);
+    LOGE("lingyi_vm_init done");
+    return 0;
+}
+
+/*
+ * 诊断：打印 JNI trace 表里注册了什么、JNIEnv 函数表槽位里实际放的是什么。
+ * 用来快速判断 "目标代码调到的地址" 和 "trace表里注册的地址" 是否一致
+ * （不一致时日志里只会出现 "Call addr: 0x... [libnativelib.so!0x...]"，没有任何 [JNI] 行）。
+ *
+ * frida: var dump = new NativeFunction(mod.getExportByName("lingyi_vm_dump_jnitrace"), 'int', []);
+ *        console.log("dump ret =", dump());
+ * 日志用 logcat 看：adb logcat -s QTrace
+ */
+extern "C" __attribute__((visibility("default")))
+int lingyi_vm_dump_jnitrace(void)
+{
+    if (pJFunc == nullptr)
+    {
+        LOGE("dump_jnitrace: pJFunc is null -> lingyi_vm_set_jnienv 没成功/还没调用");
+        return -1;
+    }
+    LOGE("dump_jnitrace: jniTrace=%d, entries=%zu",
+         is_jni_trace_enabled() ? 1 : 0,
+         _g_jni_trace != nullptr ? _g_jni_trace->map.size() : 0);
+    LOGE("dump_jnitrace: 函数表槽位 FindClass=%p, GetObjectClass=%p, GetMethodID=%p, GetFieldID=%p",
+         (void *)pJFunc->FindClass, (void *)pJFunc->GetObjectClass,
+         (void *)pJFunc->GetMethodID, (void *)pJFunc->GetFieldID);
+    if (_g_jni_trace == nullptr)
+    {
+        LOGE("dump_jnitrace: trace表还没创建(setup_jfunc 没跑)");
+        return -2;
+    }
+    const size_t findClassSlot = (size_t)pJFunc->FindClass;
+    const size_t getObjectClassSlot = (size_t)pJFunc->GetObjectClass;
+    const size_t getMethodIdSlot = (size_t)pJFunc->GetMethodID;
+    int n = 0;
+    for (auto& kv : _g_jni_trace->map)
+    {
+        const char* mark = "";
+        if (kv.first == findClassSlot)
+        {
+            mark = "   <== 当前FindClass槽位";
+        }
+        else if (kv.first == getObjectClassSlot)
+        {
+            mark = "   <== 当前GetObjectClass槽位";
+        }
+        else if (kv.first == getMethodIdSlot)
+        {
+            mark = "   <== 当前GetMethodID槽位";
+        }
+        LOGE("dump_jnitrace:   [%d] %p %s%s", n++, (void *)kv.first,
+             kv.second != nullptr && kv.second->name != nullptr ? kv.second->name : "?", mark);
+    }
+    return n;
+}
+
+/*
  * 对外导出的trace接口，frida可以直接调用（不再依赖shadowhook inline hook）：
  *   var vmCall = new NativeFunction(addr, 'pointer',
  *              ['pointer','pointer','uint32','pointer','uint32']);
@@ -348,10 +445,16 @@ size_t lingyi_vm_call(void *func_addr, size_t *args, uint32_t arg_num, const cha
          *   bit7..bit0 : 配置状态
          *                bit0 逐指令日志
          *                bit1 jni trace
-         *                bit2 jni 类名/方法名解析
+         *                bit2 jni obj类名解析(method/field名始终由hook记录)
          *                bit3 libc trace
+         *                bit4 安全模式：目标代码要调用/跳进 ART(libart/libnativehelper)
+         *                     或未知模块之前就停止trace
+         *                     (加固so的VM调JNI时ART会解引用垃圾jmethodID/jobject，
+         *                      报 "access violation accessing 0x7040xxxx"，打开它即可避免；
+         *                      停止后调用方必须把真实函数原生再跑一遍)
          *   bit31..bit8: 累计写盘阈值，字节数 = flags & 0xFFFFFF00
          * 例如 0x1000000A = 256MB + jni trace + libc trace
+         *      0x1000001A = 256MB + jni trace + libc trace + 安全模式
          * 传 0 表示沿用 initTraceEnv() 里 setBufferSize 配置的默认值
          */
         setBufferSize((int)flags);
@@ -365,6 +468,25 @@ size_t lingyi_vm_call(void *func_addr, size_t *args, uint32_t arg_num, const cha
     LOGI("lingyi_vm_call target:%p,arg_num:%u,log:%s", func_addr, arg_num,
          log_path != nullptr ? log_path : "default");
 
+    /*
+     * 每次trace前按JNIEnv函数表"当前内容"重新同步一次trace表：
+     * 函数表槽位可能在首次注册之后才被patch(或加固进程自己还原过)，
+     * 不同步就会出现"目标代码确实进了我们的hook，但trace表里没有这个地址"，
+     * 日志里只剩一行 "Call addr: 0x... [libnativelib.so!0x...]"，没有任何 [JNI] 行。
+     */
+    setJNITraceQuiet(true);
+    addJNItrace();
+    setJNITraceQuiet(false);
+    LOGE("lingyi_vm_call: jniTrace=%d, jniTraceEntries=%zu, pJFunc->FindClass=%p",
+         is_jni_trace_enabled() ? 1 : 0,
+         _g_jni_trace != nullptr ? _g_jni_trace->map.size() : 0,
+         pJFunc != nullptr ? (void *)pJFunc->FindClass : nullptr);
+    if (!is_jni_trace_enabled())
+    {
+        LOGE("lingyi_vm_call: jni trace 未开启(flags低8位缺少bit1=0x2)，本次不会输出任何 [JNI] 行；"
+             "需要JNI日志请传 0x1000000E(jni trace + 类名解析 + libc trace)");
+    }
+
     //flags 是本次trace的临时覆盖：执行完恢复原配置，避免影响后续调用
     const uint32_t savedConfig = ((uint32_t)bufsize & 0xFFFFFF00u) |
                                  ((uint32_t)bufstate & 0xFFu);
@@ -375,6 +497,17 @@ size_t lingyi_vm_call(void *func_addr, size_t *args, uint32_t arg_num, const cha
         LOGI("lingyi_vm_call: restore config 0x%x", savedConfig);
     }
     return ret;
+}
+
+/*
+ * 能力版本号：frida 侧用它确认设备上 push 的是不是新版 so。
+ *   v2 = getInstAnalysis 修复 + bit4(TRACE_CFG_STOP_BEFORE_ART 安全模式)
+ * 老 so 没有这个导出，脚本里 getExportByName 会直接抛错，从而避免"用旧 so 硬跑"再把 app 带崩。
+ */
+extern "C" __attribute__((visibility("default")))
+int lingyi_vm_api_version(void)
+{
+    return 2;
 }
 
 // no auto trace after injection, call lingyi_vm_call from frida

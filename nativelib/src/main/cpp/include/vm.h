@@ -50,7 +50,21 @@ extern void *g_deferred_call_env;
 extern int bufsize ;
 /* setBufferSize 低8位保存的配置状态，不参与写盘阈值计算 */
 extern int bufstate;
+/*
+ * 配置状态 bit4：安全模式。
+ * 目标代码一旦要 bl/blr/br 进入 ART(libart/libnativehelper) 或未知模块，立刻停止 QBDI，
+ * 绝不把 ART 的代码搬进 QBDI 里执行；libc 等普通外部调用照常执行。
+ * 原因：加固so的 VM 在 QBDI 的"重放"上下文里调 JNI 时，ART 会拿 VM 缓存里的
+ * jmethodID/jobject 去解引用，落到 linear alloc 空洞上直接 SIGSEGV
+ * ("access violation accessing 0x7040xxxx")。
+ * 打开后由调用方(frida)在 trace 结束后把真实函数原生再跑一遍。
+ */
+#define TRACE_CFG_STOP_BEFORE_ART (1 << 4)
 extern bool debugInsn;
+/* 当前线程是否正在跑QBDI trace（jni回调里据此避免在QBDI栈上调用JNI） */
+bool is_trace_running();
+/* 本次trace是否因为 bit4(TRACE_CFG_STOP_BEFORE_ART) 主动提前结束（目标函数没跑完） */
+bool trace_stopped_at_cross();
 void setBufferSize(int);
 void enableDebugInsn(bool);
 

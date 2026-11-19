@@ -17,7 +17,9 @@ int setup_jni_env(void* env);
 void enable_jni_trace_debug(bool enable);
 /* 当前jni trace开关状态(由setBufferSize的bit1控制) */
 bool is_jni_trace_enabled();
-/* 是否允许在回调里用JNI反射解析 obj 类名 / method 名称，默认开启 */
+/* 是否允许记录类名（bit2）：和methodID/fieldID一样，在JNIEnv函数表上hook
+ * (FindClass/GetObjectClass/Get*ID)把 jclass->类名、obj->jclass 缓存下来，
+ * 供trace时直接查表。trace回调里不做任何JNI调用，避免ART在QBDI改写的栈上抛异常崩溃。 */
 void enable_jni_resolve(bool enable);
 
 struct JNITraceMap {
@@ -26,6 +28,8 @@ struct JNITraceMap {
 
 extern JNITraceMap* _g_jni_trace;
 void addJNITrace(void* target,const char* funcname,TraceCallBack callback);
+/* 重新注册trace表时静默(不打印"已注册"日志)，用于每次trace前的同步 */
+void setJNITraceQuiet(bool quiet);
 
 void trace_FindClass(QBDI::VM *vm, QBDI::GPRState *gprState);
 void trace_NewStringUTF(QBDI::VM *vm, QBDI::GPRState *gprState);

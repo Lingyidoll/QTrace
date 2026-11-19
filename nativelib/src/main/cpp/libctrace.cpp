@@ -646,3 +646,62 @@ void libc_close(QBDI::VM *vm, QBDI::GPRState *gprState)
     appendformat("close(fd=%d)", (int)(int32_t)(uint32_t)QBDI_GPR_GET(gprState, 0));
     appendlogendl();
 }
+
+/* mmap(addr, length, prot, flags, fd, offset)：返回值为映射后的地址 */
+void libc_mmap(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    appendformat("mmap(addr=0x%lx, length=0x%lx, prot=0x%lx, flags=0x%lx, fd=%d, offset=0x%lx)",
+                 QBDI_GPR_GET(gprState, 0),
+                 QBDI_GPR_GET(gprState, 1),
+                 QBDI_GPR_GET(gprState, 2),
+                 QBDI_GPR_GET(gprState, 3),
+                 (int)(int32_t)(uint32_t)QBDI_GPR_GET(gprState, 4),
+                 QBDI_GPR_GET(gprState, 5));
+    appendlogendl();
+}
+
+void libc_munmap(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    appendformat("munmap(addr=0x%lx, length=0x%lx)",
+                 QBDI_GPR_GET(gprState, 0),
+                 QBDI_GPR_GET(gprState, 1));
+    appendlogendl();
+}
+
+/* dlsym(handle, symbol)：symbol是C字符串，返回解析到的函数地址 */
+void libc_dlsym(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    appendformat("dlsym(handle=0x%lx, symbol=", QBDI_GPR_GET(gprState, 0));
+    appendCStringArg(QBDI_GPR_GET(gprState, 1));
+    appendlog(")");
+    appendlogendl();
+}
+
+/* strdup(s)：返回堆上新分配的字符串 */
+void libc_strdup(QBDI::VM *vm, QBDI::GPRState *gprState)
+{
+    if(_logger == nullptr)
+    {
+        LOGE("libc trace:logger not init!");
+        return;
+    }
+    appendlog("strdup(s=");
+    appendCStringArg(QBDI_GPR_GET(gprState, 0));
+    appendlog(")");
+    appendlogendl();
+}

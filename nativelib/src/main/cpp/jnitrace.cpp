@@ -7,6 +7,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <mutex>
+#include <sys/mman.h>
+#include <unistd.h>
 #include "jnitrace.h"
 #include "HookUtils.h"
 #include "TraceUtils.h"
@@ -16,31 +19,72 @@ const JNINativeInterface* pJFunc = nullptr;
  JNIEnv * jniEnv = nullptr;
 JNITraceMap* _g_jni_trace = nullptr;
 static bool debug = false;
-/* 是否允许在QBDI回调里通过JNI反射解析 obj 类名 / method 名称。
+/* 是否允许做需要调用JNI的解析(obj/clazz 类名：GetObjectClass + Class.getName())。
+ * methodID/fieldID 名称不走JNI：JNIEnv一就绪(setup_jni_env/initJni)就装函数表hook并一直记录。
  * 某些加固/自定义VM上JNIEnv不可靠时可关掉，保证trace稳定 */
 static bool jniResolveEnabled = true;
 
+/* ---------------- methodID / fieldID -> 名称 ---------------- */
+
+static std::unordered_map<uint64_t, std::string> g_method_names;   // methodID  -> 方法名
+static std::unordered_map<uint64_t, std::string> g_method_sigs;    // methodID  -> 方法签名，如 "()Ljava/lang/String;"
+static std::unordered_map<uint64_t, std::string> g_field_names;    // fieldID   -> 字段名
+static std::unordered_map<uint64_t, std::string> g_class_names;    // jclass    -> 类名
+static std::unordered_map<uint64_t, uint64_t> g_object_classes;    // jobject   -> jclass
+/* 创建即已知类型的引用(NewStringUTF/NewString 的 jstring、NewObject 的实例、FindClass 的 jclass)。
+ * ART 会把回收的局部引用句柄值复用给新对象，只靠 obj->jclass 反查会命中上一个对象留下的
+ * 脏映射(例如新建的 String 显示成 com.meituan.robust.PatchProxy)，所以这里按句柄直接记类名 */
+static std::unordered_map<uint64_t, std::string> g_ref_class_names;
+/* java.lang.Class 的全局引用和 Class.getName() 的methodID，解析类名时复用，
+ * 避免每次都 FindClass("java/lang/Class") */
+static jclass g_java_lang_class = nullptr;
+static jmethodID g_class_get_name = nullptr;
+/* GetMethodID/GetStaticMethodID 的hook可能在任意线程触发，缓存表读写必须加锁 */
+static std::mutex g_jni_name_mutex;
+
+static void cacheMethodName(uint64_t methodId, uint64_t namePtr);
+static void cacheMethodSig(uint64_t methodId, uint64_t sigPtr);
+static void cacheFieldName(uint64_t fieldId, uint64_t namePtr);
+static void cacheClassName(uint64_t clazz, JNIEnv* env);
+static void cacheClassNameFromDescriptor(uint64_t clazz, const char* name);
+static void cacheObjectClass(uint64_t obj, uint64_t clazz);
+static void cacheKnownRefClass(uint64_t ref, const char* className);
+/* 引用句柄与类信息的关联：只在trace回调里做纯查表，不hook任何JNIEnv槽位 */
+static void linkRefClassName(uint64_t srcRef, uint64_t newRef);
+static void forgetRefClass(uint64_t ref);
+static void installJniIdHooks();
+
+/*
+ * 开关"需要JNI调用的名称解析"(obj/clazz 类名)。
+ * methodID/fieldID -> 名称 的缓存不依赖这个开关：hook在setup_jni_env/initJni里就已经装好，
+ * 只要能拿到JNIEnv就持续记录，trace时只查表。
+ */
 void enable_jni_resolve(bool enable)
 {
     jniResolveEnabled = enable;
+    if (enable)
+    {
+        //兜底：JNIEnv已就绪但之前装hook失败(例如RELRO页不可写)时再试一次
+        installJniIdHooks();
+    }
 }
 
 /*
- * 查询地址所在内存映射是否具备某个权限位。
- * perms 形如 "r-xp"：index0=r, index1=w, index2=x。
+ * 查询地址所在内存映射的权限。perms 形如 "r-xp"：index0=r, index1=w, index2=x。
  * dlsym / ELF符号解析在某些机型上可能返回非可执行地址，直接调用会 access violation，
  * 调用前必须先校验，否则会把整个进程带崩。
  */
-static bool isAddrWithPerm(size_t addr, int permIndex)
+static bool getAddrPerms(size_t addr, char* perms, size_t size)
 {
-    if (addr == 0)
+    if (addr == 0 || perms == nullptr || size < 4)
     {
         return false;
     }
+    perms[0] = 0;
     FILE *fp = fopen("/proc/self/maps", "r");
     if (fp == nullptr)
     {
-        LOGE("isAddrWithPerm: open maps fail");
+        LOGE("getAddrPerms: open maps fail");
         return false;
     }
     bool ok = false;
@@ -50,17 +94,28 @@ static bool isAddrWithPerm(size_t addr, int permIndex)
     {
         size_t start = 0;
         size_t end = 0;
-        char perms[8] = {0};
-        if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) == 3 &&
+        char tmp[8] = {0};
+        if (sscanf(line, "%lx-%lx %7s", &start, &end, tmp) == 3 &&
             addr >= start && addr < end)
         {
-            ok = (perms[permIndex] != '-');
+            snprintf(perms, size, "%s", tmp);
+            ok = true;
             break;
         }
     }
     free(line);
     fclose(fp);
     return ok;
+}
+
+static bool isAddrWithPerm(size_t addr, int permIndex)
+{
+    char perms[8] = {0};
+    if (!getAddrPerms(addr, perms, sizeof(perms)))
+    {
+        return false;
+    }
+    return perms[permIndex] != '-';
 }
 
 /* 地址是否可执行 */
@@ -73,6 +128,184 @@ static bool isAddrExecutable(size_t addr)
 static bool isAddrReadable(size_t addr)
 {
     return isAddrWithPerm(addr, 0);
+}
+
+/* ---------------- JNIEnv 函数表 hook：记录 id -> 名称 ----------------
+ * JNINativeInterface 是libart里的全局只读表，所有JNI调用都从这张表进入ART。
+ * 把 GetMethodID/GetStaticMethodID/GetFieldID/GetStaticFieldID 换成包装函数后，
+ * 进程内(包括trace开始前的JNI_OnLoad阶段)拿到的id都会带着名字写进缓存表，
+ * 后续trace只查缓存，不再做JNI反射反查，简单且没有额外解析开销。
+ */
+typedef jmethodID (*JNIGetMethodIDFn)(JNIEnv*, jclass, const char*, const char*);
+typedef jfieldID (*JNIGetFieldIDFn)(JNIEnv*, jclass, const char*, const char*);
+typedef jclass (*JNIFindClassFn)(JNIEnv*, const char*);
+typedef jclass (*JNIGetObjectClassFn)(JNIEnv*, jobject);
+
+static JNIGetMethodIDFn g_orig_GetMethodID = nullptr;
+static JNIGetMethodIDFn g_orig_GetStaticMethodID = nullptr;
+static JNIGetFieldIDFn g_orig_GetFieldID = nullptr;
+static JNIGetFieldIDFn g_orig_GetStaticFieldID = nullptr;
+static JNIFindClassFn g_orig_FindClass = nullptr;
+static JNIGetObjectClassFn g_orig_GetObjectClass = nullptr;
+static bool g_jni_id_hook_installed = false;
+
+static jmethodID JNICALL hook_GetMethodID(JNIEnv* env, jclass clazz, const char* name, const char* sig)
+{
+    jmethodID id = g_orig_GetMethodID != nullptr ? g_orig_GetMethodID(env, clazz, name, sig) : nullptr;
+    //纯粹记账，不调用任何JNI，始终记录，保证trace时能直接查到名字
+    cacheMethodName((uint64_t)id, (uint64_t)name);
+    //签名也要记：Call*Method 的变参必须按签名逐个解码
+    cacheMethodSig((uint64_t)id, (uint64_t)sig);
+    cacheClassName((uint64_t)clazz, env);
+    return id;
+}
+
+static jmethodID JNICALL hook_GetStaticMethodID(JNIEnv* env, jclass clazz, const char* name, const char* sig)
+{
+    jmethodID id = g_orig_GetStaticMethodID != nullptr ? g_orig_GetStaticMethodID(env, clazz, name, sig) : nullptr;
+    cacheMethodName((uint64_t)id, (uint64_t)name);
+    cacheMethodSig((uint64_t)id, (uint64_t)sig);
+    cacheClassName((uint64_t)clazz, env);
+    return id;
+}
+
+static jfieldID JNICALL hook_GetFieldID(JNIEnv* env, jclass clazz, const char* name, const char* sig)
+{
+    jfieldID id = g_orig_GetFieldID != nullptr ? g_orig_GetFieldID(env, clazz, name, sig) : nullptr;
+    cacheFieldName((uint64_t)id, (uint64_t)name);
+    cacheClassName((uint64_t)clazz, env);
+    return id;
+}
+
+static jfieldID JNICALL hook_GetStaticFieldID(JNIEnv* env, jclass clazz, const char* name, const char* sig)
+{
+    jfieldID id = g_orig_GetStaticFieldID != nullptr ? g_orig_GetStaticFieldID(env, clazz, name, sig) : nullptr;
+    cacheFieldName((uint64_t)id, (uint64_t)name);
+    cacheClassName((uint64_t)clazz, env);
+    return id;
+}
+
+/* FindClass 的返回值直接就是 jclass，类名来自入参，不需要任何反射 */
+static jclass JNICALL hook_FindClass(JNIEnv* env, const char* name)
+{
+    jclass clazz = g_orig_FindClass != nullptr ? g_orig_FindClass(env, name) : nullptr;
+    cacheClassNameFromDescriptor((uint64_t)clazz, name);
+    return clazz;
+}
+
+/* GetObjectClass 记录 obj -> jclass，trace时就能反查 obj 的类名 */
+static jclass JNICALL hook_GetObjectClass(JNIEnv* env, jobject obj)
+{
+    jclass clazz = g_orig_GetObjectClass != nullptr ? g_orig_GetObjectClass(env, obj) : nullptr;
+    //返回的是新的局部引用，句柄值可能刚被ART复用给别的类：
+    //先清掉这个句柄上的旧信息，否则 cacheClassName 会直接命中上次的类名
+    forgetRefClass((uint64_t)clazz);
+    cacheObjectClass((uint64_t)obj, (uint64_t)clazz);
+    //类名缓存里还没有时，趁现在(不在QBDI里)补一次 Class.getName()
+    cacheClassName((uint64_t)clazz, env);
+    return clazz;
+}
+
+/*
+ * 修改JNIEnv函数表里的一个函数指针槽位，原函数保存到origFunc里。
+ * 该表在libart的RELRO段中，默认只读，先mprotect成可写，改完恢复原来的权限。
+ */
+static bool patchJniFuncSlot(void** slot, void* newFunc, void** origFunc)
+{
+    if (slot == nullptr || *slot == nullptr || newFunc == nullptr || origFunc == nullptr)
+    {
+        return false;
+    }
+    if (*slot == newFunc)
+    {
+        return true;    //已经装过了
+    }
+    char perms[8] = {0};
+    if (!getAddrPerms((size_t)slot, perms, sizeof(perms)))
+    {
+        LOGE("jni resolve: read maps fail for %p", (void*)slot);
+        return false;
+    }
+    long pageSize = sysconf(_SC_PAGESIZE);
+    if (pageSize <= 0)
+    {
+        pageSize = 4096;
+    }
+    uintptr_t pageMask = (uintptr_t)pageSize - 1;
+    uintptr_t pageStart = (uintptr_t)slot & ~pageMask;
+    uintptr_t pageEnd = ((uintptr_t)slot + sizeof(void*) + pageMask) & ~pageMask;
+    int prot = 0;
+    if (perms[0] == 'r') prot |= PROT_READ;
+    if (perms[1] == 'w') prot |= PROT_WRITE;
+    if (perms[2] == 'x') prot |= PROT_EXEC;
+    if (mprotect((void*)pageStart, pageEnd - pageStart, prot | PROT_WRITE) != 0)
+    {
+        LOGE("jni resolve: mprotect %p fail", (void*)slot);
+        return false;
+    }
+    //对齐的8字节写入在arm64上是原子的，不需要额外同步
+    *origFunc = *slot;
+    *slot = newFunc;
+    mprotect((void*)pageStart, pageEnd - pageStart, prot);
+    return true;
+}
+
+/* 在JNIEnv函数表上装hook，失败时静默降级为只依赖QBDI trace到的GetMethodID */
+static void installJniIdHooks()
+{
+    if (g_jni_id_hook_installed || pJFunc == nullptr)
+    {
+        return;
+    }
+    auto* funcs = const_cast<JNINativeInterface*>(pJFunc);
+    bool ok = patchJniFuncSlot((void**)&funcs->GetMethodID, (void*)hook_GetMethodID,
+                               (void**)&g_orig_GetMethodID);
+    ok &= patchJniFuncSlot((void**)&funcs->GetStaticMethodID, (void*)hook_GetStaticMethodID,
+                           (void**)&g_orig_GetStaticMethodID);
+    ok &= patchJniFuncSlot((void**)&funcs->GetFieldID, (void*)hook_GetFieldID,
+                           (void**)&g_orig_GetFieldID);
+    ok &= patchJniFuncSlot((void**)&funcs->GetStaticFieldID, (void*)hook_GetStaticFieldID,
+                           (void**)&g_orig_GetStaticFieldID);
+    //类名相关：FindClass 直接带类名，GetObjectClass 给出 obj -> jclass 的对应关系
+    ok &= patchJniFuncSlot((void**)&funcs->FindClass, (void*)hook_FindClass,
+                           (void**)&g_orig_FindClass);
+    ok &= patchJniFuncSlot((void**)&funcs->GetObjectClass, (void*)hook_GetObjectClass,
+                           (void**)&g_orig_GetObjectClass);
+    //注意：这里必须无条件置位。函数表一旦被patch，addJNItrace 注册的就是hook地址；
+    //如果之后又重装并改动函数表，trace表里就只剩ART地址，目标代码直接调hook会trace不到
+    //(表现为FindClass等函数完全没有 [JNI] 日志，只剩一行 "Call addr: ... libnativelib.so")。
+    g_jni_id_hook_installed = true;
+    LOGE("jni resolve: hook JNIEnv Get*ID/FindClass/GetObjectClass %s", ok ? "success" : "partial");
+}
+
+/* 函数表被hook后，注册QBDI trace要用原始ART函数地址，否则trace不到目标代码里的JNI调用 */
+static void* jniOriginalFunc(void* target)
+{
+    if (target == (void*)hook_GetMethodID && g_orig_GetMethodID != nullptr)
+    {
+        return (void*)g_orig_GetMethodID;
+    }
+    if (target == (void*)hook_GetStaticMethodID && g_orig_GetStaticMethodID != nullptr)
+    {
+        return (void*)g_orig_GetStaticMethodID;
+    }
+    if (target == (void*)hook_GetFieldID && g_orig_GetFieldID != nullptr)
+    {
+        return (void*)g_orig_GetFieldID;
+    }
+    if (target == (void*)hook_GetStaticFieldID && g_orig_GetStaticFieldID != nullptr)
+    {
+        return (void*)g_orig_GetStaticFieldID;
+    }
+    if (target == (void*)hook_FindClass && g_orig_FindClass != nullptr)
+    {
+        return (void*)g_orig_FindClass;
+    }
+    if (target == (void*)hook_GetObjectClass && g_orig_GetObjectClass != nullptr)
+    {
+        return (void*)g_orig_GetObjectClass;
+    }
+    return target;
 }
 
 static void* resolveJniGetCreatedJavaVMs()
@@ -148,6 +381,8 @@ void initJni()
     jint jniVersion = env->GetVersion();
     LOGE("get JNIEnv success:%x",jniVersion);
     setup_jfunc(env);
+    //JNIEnv一就绪就装函数表hook，尽早开始记录 methodID/fieldID -> 名称
+    installJniIdHooks();
 }
 
 /*
@@ -178,6 +413,9 @@ int setup_jni_env(void* env)
         return -1;
     }
     setup_jfunc(jni);
+    //拿到JNIEnv就立刻装hook：之后进程内所有GetMethodID/GetFieldID调用都会把id->名称记进缓存表，
+    //比等到enable_jni_resolve(trace开始前)再装要早得多
+    installJniIdHooks();
     LOGE("setup_jni_env from caller:%p", env);
     return 0;
 }
@@ -286,50 +524,139 @@ static void appendHexdump(uint64_t addr, uint64_t len, uint64_t maxLen)
     }
 }
 
-/*
- * 当前被trace的JNI调用自己的JNIEnv(x0)。
- * JNI局部引用/jmethodID与线程和env绑定，解析时必须用调用现场的env，
- * 不能用初始化阶段保存的其它线程env，否则ART会解出非法引用并崩溃。
- */
-static JNIEnv* currentCallEnv()
+/* 清除我们自己在hook里触发的JNI异常，避免影响目标代码 */
+static void clearExceptionOn(JNIEnv* env)
 {
-    uint64_t env = (uint64_t)g_deferred_call_env;
-    if (env == 0)
+    if (pJFunc != nullptr && env != nullptr && pJFunc->ExceptionCheck(env))
+    {
+        pJFunc->ExceptionClear(env);
+    }
+}
+
+/*
+ * 懒加载 java.lang.Class 的全局引用：解析类名要用。
+ * 失败返回nullptr(下次调用会重试)。
+ */
+static jclass ensureJavaLangClass(JNIEnv* env)
+{
+    if (g_java_lang_class != nullptr || env == nullptr || pJFunc == nullptr)
+    {
+        return g_java_lang_class;
+    }
+    jclass localClass = pJFunc->FindClass(env, "java/lang/Class");
+    if (localClass == nullptr)
+    {
+        clearExceptionOn(env);
+        return nullptr;
+    }
+    jclass globalClass = (jclass)pJFunc->NewGlobalRef(env, localClass);
+    pJFunc->DeleteLocalRef(env, localClass);
+    //局部句柄已释放，FindClass hook顺手记下的那条类名要一起清掉，避免句柄复用时张冠李戴
+    forgetRefClass((uint64_t)localClass);
+    if (globalClass == nullptr)
+    {
+        clearExceptionOn(env);
+        return nullptr;
+    }
+    g_java_lang_class = globalClass;
+    return g_java_lang_class;
+}
+
+/* 懒加载 Class.getName() 的methodID，methodID只能从 java.lang.Class 取 */
+static jmethodID ensureClassGetNameMethod(JNIEnv* env)
+{
+    if (g_class_get_name != nullptr || env == nullptr || pJFunc == nullptr)
+    {
+        return g_class_get_name;
+    }
+    jclass classClass = ensureJavaLangClass(env);
+    if (classClass == nullptr)
     {
         return nullptr;
     }
-    //同一线程的env会复用，做个轻量校验+缓存，防止异常env把解析流程带崩
-    static thread_local uint64_t lastEnv = 0;
-    static thread_local bool lastEnvOk = false;
-    if (env == lastEnv)
+    //用原始GetMethodID，避免递归进入本文件的hook
+    JNIGetMethodIDFn getMethodId = g_orig_GetMethodID != nullptr ? g_orig_GetMethodID
+                                                                : pJFunc->GetMethodID;
+    jmethodID method = getMethodId(env, classClass, "getName", "()Ljava/lang/String;");
+    if (method == nullptr)
     {
-        return lastEnvOk ? (JNIEnv*)env : nullptr;
+        clearExceptionOn(env);
+        return nullptr;
     }
-    lastEnv = env;
-    uint64_t functions = 0;
-    lastEnvOk = safeReadMemory(env, (uint8_t*)&functions, sizeof(functions)) &&
-                isValidAddress(functions);
-    if (!lastEnvOk)
-    {
-        LOGE("jnitrace: invalid JNIEnv 0x%lx, skip jni resolve", env);
-    }
-    return lastEnvOk ? (JNIEnv*)env : nullptr;
-}
-
-/* 清除回调内自己触发的JNI异常，避免影响目标代码 */
-static void clearPendingException()
-{
-    if (pJFunc != nullptr && currentCallEnv() != nullptr && pJFunc->ExceptionCheck(currentCallEnv()))
-    {
-        pJFunc->ExceptionClear(currentCallEnv());
-    }
+    g_class_get_name = method;
+    return g_class_get_name;
 }
 
 /*
- * 通过JNI反射解析jobject/jclass对应的java类名，例如：
- *   obj            -> java.lang.String
- *   jclass(String) -> java.lang.String
- * 解析失败(非指针/非法引用)时返回false，不输出类名。
+ * 解析 jclass -> 类名 并缓存，供trace时直接查表。
+ * 只允许在"当前线程没有跑QBDI trace"时调用：QBDI执行期间调JNI，一旦ART抛Java异常，它会走
+ * Throwable.fillInStackTrace -> StackVisitor::WalkStack 去遍历被QBDI改写过的栈帧，读到垃圾指针
+ * 直接SIGSEGV(加固so上必崩)。本函数在JNIEnv函数表hook里执行，是普通native上下文，安全。
+ */
+static void cacheClassName(uint64_t clazz, JNIEnv* env)
+{
+    if (clazz == 0 || env == nullptr || pJFunc == nullptr || !jniResolveEnabled)
+    {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_jni_name_mutex);
+        if (g_class_names.find(clazz) != g_class_names.end())
+        {
+            return;     //已经缓存过
+        }
+    }
+    //QBDI执行期间绝对不碰JNI
+    if (is_trace_running())
+    {
+        return;
+    }
+    //防止GetMethodID的hook递归回自己
+    static thread_local bool resolving = false;
+    if (resolving)
+    {
+        return;
+    }
+    struct ResolveGuard {
+        bool& flag;
+        explicit ResolveGuard(bool& f) : flag(f) { flag = true; }
+        ~ResolveGuard() { flag = false; }
+    } guard(resolving);
+
+    jmethodID getNameMethod = ensureClassGetNameMethod(env);
+    if (getNameMethod == nullptr)
+    {
+        return;
+    }
+    //clazz本身就是一个 java.lang.Class 实例，直接调 Class.getName()
+    jstring jname = (jstring)pJFunc->CallObjectMethod(env, (jobject)clazz, getNameMethod);
+    if (jname == nullptr)
+    {
+        clearExceptionOn(env);
+        return;
+    }
+    const char* utf = pJFunc->GetStringUTFChars(env, jname, nullptr);
+    if (utf != nullptr)
+    {
+        std::string name(utf);
+        pJFunc->ReleaseStringUTFChars(env, jname, utf);
+        std::lock_guard<std::mutex> lock(g_jni_name_mutex);
+        g_class_names[clazz] = name;
+    }
+    else
+    {
+        clearExceptionOn(env);
+    }
+    pJFunc->DeleteLocalRef(env, jname);
+}
+
+/*
+ * 输出obj/clazz的类名：只查缓存表，trace回调里不做任何JNI调用。
+ * 缓存全部由JNIEnv函数表hook(installJniIdHooks)填充：
+ *   FindClass(clazz)     -> jclass -> 类名
+ *   GetObjectClass(obj)  -> obj -> jclass
+ *   Get*ID(clazz,...)    -> 兜底用 Class.getName() 补类名
+ * 所以obj会先查 obj->jclass，再查 jclass->类名。
  */
 static bool resolveJavaClassName(uint64_t ref, char* out, size_t size)
 {
@@ -338,72 +665,32 @@ static bool resolveJavaClassName(uint64_t ref, char* out, size_t size)
         return false;
     }
     out[0] = 0;
-    if (!jniResolveEnabled)
+    if (ref == 0 || !jniResolveEnabled)
     {
         return false;
     }
-    //防止target模块就是libart时，解析过程被自己的回调再次捕获导致递归
-    static thread_local bool resolving = false;
-    if (resolving)
+    std::lock_guard<std::mutex> lock(g_jni_name_mutex);
+    //优先用"创建时就确定类型"的记录(NewStringUTF/NewString/NewObject/FindClass)，
+    //句柄值被ART复用后，obj->jclass 这条链路可能还指着上一个对象
+    auto knownIt = g_ref_class_names.find(ref);
+    if (knownIt != g_ref_class_names.end() && !knownIt->second.empty())
+    {
+        snprintf(out, size, "%s", knownIt->second.c_str());
+        return true;
+    }
+    uint64_t cls = ref;
+    auto objIt = g_object_classes.find(ref);
+    if (objIt != g_object_classes.end())
+    {
+        cls = objIt->second;    //GetObjectClass hook记录过 obj -> jclass
+    }
+    auto it = g_class_names.find(cls);
+    if (it == g_class_names.end() || it->second.empty())
     {
         return false;
     }
-    struct ResolveGuard {
-        bool& flag;
-        explicit ResolveGuard(bool& f) : flag(f) { flag = true; }
-        ~ResolveGuard() { flag = false; }
-    } guard(resolving);
-    if (ref < 0x1000 || currentCallEnv() == nullptr || pJFunc == nullptr)
-    {
-        return false;
-    }
-    //目标代码可能正处于异常状态，此时调用JNI会破坏原有异常，直接跳过解析
-    if (pJFunc->ExceptionCheck(currentCallEnv()))
-    {
-        return false;
-    }
-    //jobject可能是带tag的指针，也可能只是编码后的index，先验证地址可读
-    uint8_t probe = 0;
-    if (!safeReadMemory(ref & ~(uint64_t)7, &probe, sizeof(probe)))
-    {
-        return false;
-    }
-    static jmethodID getNameMethod = nullptr;
-    jclass clazz = (jclass)pJFunc->GetObjectClass(currentCallEnv(), (jobject)ref);
-    if (clazz == nullptr)
-    {
-        clearPendingException();
-        return false;
-    }
-    if (getNameMethod == nullptr)
-    {
-        getNameMethod = pJFunc->GetMethodID(currentCallEnv(), clazz, "getName", "()Ljava/lang/String;");
-    }
-    if (getNameMethod == nullptr)
-    {
-        pJFunc->DeleteLocalRef(currentCallEnv(), clazz);
-        clearPendingException();
-        return false;
-    }
-    jstring jname = (jstring)pJFunc->CallObjectMethod(currentCallEnv(), clazz, getNameMethod);
-    bool ok = false;
-    if (jname != nullptr)
-    {
-        const char* utf = pJFunc->GetStringUTFChars(currentCallEnv(), jname, nullptr);
-        if (utf != nullptr)
-        {
-            snprintf(out, size, "%s", utf);
-            pJFunc->ReleaseStringUTFChars(currentCallEnv(), jname, utf);
-            ok = true;
-        }
-        pJFunc->DeleteLocalRef(currentCallEnv(), jname);
-    }
-    pJFunc->DeleteLocalRef(currentCallEnv(), clazz);
-    if (!ok)
-    {
-        clearPendingException();
-    }
-    return ok;
+    snprintf(out, size, "%s", it->second.c_str());
+    return true;
 }
 
 /* 输出一行 "obj = java.lang.String" / "clazz = com.xxx.A"，解析失败也给出标记 */
@@ -425,12 +712,7 @@ static void appendJavaClassLine(const char* label, uint64_t ref)
     }
 }
 
-/* ---------------- methodID / fieldID -> 名称 ---------------- */
 
-static std::unordered_map<uint64_t, std::string> g_method_names;   // methodID  -> 方法名
-static std::unordered_map<uint64_t, std::string> g_field_names;    // fieldID   -> 字段名
-static std::unordered_map<uint64_t, bool> g_method_name_failed;    // 反查失败的方法，避免重复扫描
-static int g_method_reflect_budget = 128;                          // 反射反查预算(每个methodID只扫一次)
 
 /* 安全读取C字符串到缓冲区，读不到/没有终止符时返回false */
 static bool readCStringSafe(uint64_t addr, char* out, size_t size)
@@ -463,33 +745,173 @@ static bool readCStringSafe(uint64_t addr, char* out, size_t size)
 /* GetMethodID/GetStaticMethodID 调用时直接把 id->name 记下来，后续 Call*Method 零成本命中 */
 static void cacheMethodName(uint64_t methodId, uint64_t namePtr)
 {
-    if (methodId == 0)
+    if (methodId == 0 || namePtr == 0)
     {
         return;
     }
     char name[128] = {0};
-    if (readCStringSafe(namePtr, name, sizeof(name)))
+    if (!readCStringSafe(namePtr, name, sizeof(name)) || name[0] == 0)
     {
-        g_method_names[methodId] = name;
+        return;
     }
+    std::lock_guard<std::mutex> lock(g_jni_name_mutex);
+    g_method_names[methodId] = name;
 }
 
 static void cacheFieldName(uint64_t fieldId, uint64_t namePtr)
 {
-    if (fieldId == 0)
+    if (fieldId == 0 || namePtr == 0)
     {
         return;
     }
     char name[128] = {0};
-    if (readCStringSafe(namePtr, name, sizeof(name)))
+    if (!readCStringSafe(namePtr, name, sizeof(name)) || name[0] == 0)
     {
-        g_field_names[fieldId] = name;
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_jni_name_mutex);
+    g_field_names[fieldId] = name;
+}
+
+/* GetMethodID/GetStaticMethodID 时把签名一起记下来：Call*Method 的变参要按签名解码 */
+static void cacheMethodSig(uint64_t methodId, uint64_t sigPtr)
+{
+    if (methodId == 0 || sigPtr == 0)
+    {
+        return;
+    }
+    char sig[128] = {0};
+    if (!readCStringSafe(sigPtr, sig, sizeof(sig)) || sig[0] != '(')
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_jni_name_mutex);
+    g_method_sigs[methodId] = sig;
+}
+
+/* FindClass 的入参是 "java/lang/String" 这种描述符，转成 "java.lang.String" 直接存进类名表 */
+static void cacheClassNameFromDescriptor(uint64_t clazz, const char* name)
+{
+    if (clazz == 0 || name == nullptr || name[0] == 0 || !jniResolveEnabled)
+    {
+        return;
+    }
+    std::string cls(name);
+    for (size_t i = 0; i < cls.size(); ++i)
+    {
+        if (cls[i] == '/')
+        {
+            cls[i] = '.';
+        }
+    }
+    std::lock_guard<std::mutex> lock(g_jni_name_mutex);
+    //句柄值可能被ART复用(上一个对象刚被回收)，先清掉旧映射
+    g_object_classes.erase(clazz);
+    g_ref_class_names[clazz] = cls;
+    //FindClass 的返回值类型是确定的，两张表都写：linkRefClassName 靠 g_class_names 判断"引用的是类本身"
+    g_class_names[clazz] = cls;
+}
+
+/* GetObjectClass 的返回值：记录 obj -> jclass，trace时反查 obj 的类名 */
+static void cacheObjectClass(uint64_t obj, uint64_t clazz)
+{
+    if (obj == 0 || clazz == 0 || !jniResolveEnabled)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_jni_name_mutex);
+    //局部引用被ART复用，条目数量有限，这里再做一层上限保护
+    if (g_object_classes.size() >= 8192)
+    {
+        return;
+    }
+    g_object_classes[obj] = clazz;
+}
+
+/*
+ * 刚创建出来的引用，类型是确定的（用的是同一个句柄值也可能刚被回收复用），
+ * 所以先把这个句柄上的旧映射清掉，再记真实类名，trace时优先查这张表。
+ */
+static void cacheKnownRefClass(uint64_t ref, const char* className)
+{
+    if (ref == 0 || className == nullptr || className[0] == 0 || !jniResolveEnabled)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_jni_name_mutex);
+    g_object_classes.erase(ref);
+    g_class_names.erase(ref);
+    g_ref_class_names[ref] = className;
+}
+
+/* ---------------- 引用句柄与类信息的关联 ----------------
+ * NewGlobalRef/NewLocalRef 返回的是新句柄，ART里新句柄的值和源引用不相等；
+ * DeleteGlobalRef/DeleteWeakGlobalRef 之后句柄值会被ART回收复用。
+ * 这里只在QBDI的trace回调(trace_ReferenceFunc)里做纯查表的继承/删除，
+ * 不hook任何JNIEnv槽位(在函数表上拦引用函数会造成崩溃)。
+ */
+
+/* 删掉一个句柄上的全部类信息 */
+static void forgetRefClass(uint64_t ref)
+{
+    if (ref == 0)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_jni_name_mutex);
+    g_class_names.erase(ref);
+    g_object_classes.erase(ref);
+    g_ref_class_names.erase(ref);
+}
+
+/*
+ * 把 srcRef 上缓存的类信息复制给新句柄 newRef（newRef = NewGlobalRef/NewLocalRef(srcRef)）。
+ * 纯查表，不调用任何JNI，可以在QBDI trace回调里安全执行。
+ */
+static void linkRefClassName(uint64_t srcRef, uint64_t newRef)
+{
+    if (srcRef == 0 || newRef == 0 || srcRef == newRef || !jniResolveEnabled)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_jni_name_mutex);
+    //"创建即已知类型"的引用(NewStringUTF/NewObject/FindClass)直接有类名
+    auto knownIt = g_ref_class_names.find(srcRef);
+    if (knownIt != g_ref_class_names.end() && !knownIt->second.empty())
+    {
+        g_object_classes.erase(newRef);
+        g_class_names.erase(newRef);
+        g_ref_class_names[newRef] = knownIt->second;
+        return;
+    }
+    //源引用是 jclass(FindClass/Get*ID 记过)：新句柄就是同一个类的jclass
+    auto clsIt = g_class_names.find(srcRef);
+    if (clsIt != g_class_names.end() && !clsIt->second.empty())
+    {
+        g_object_classes.erase(newRef);
+        g_ref_class_names.erase(newRef);
+        g_class_names[newRef] = clsIt->second;
+        return;
+    }
+    //普通实例：新句柄仍是同一个类的实例，补一条 obj -> jclass
+    auto objIt = g_object_classes.find(srcRef);
+    if (objIt != g_object_classes.end() && objIt->second != 0)
+    {
+        if (g_object_classes.size() < 8192)
+        {
+            g_object_classes[newRef] = objIt->second;
+        }
     }
 }
 
 /* 只查缓存 */
 static bool lookupMethodName(uint64_t methodId, char* out, size_t size)
 {
+    if (out == nullptr || size == 0)
+    {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_jni_name_mutex);
     auto it = g_method_names.find(methodId);
     if (it == g_method_names.end() || it->second.empty())
     {
@@ -499,186 +921,30 @@ static bool lookupMethodName(uint64_t methodId, char* out, size_t size)
     return true;
 }
 
-/* 在 Method[] 里按 FromReflectedMethod 的返回值找目标 methodID */
-static bool scanMethodArray(jobjectArray methods, uint64_t methodId, char* out, size_t size)
-{
-    if (methods == nullptr)
-    {
-        return false;
-    }
-    jsize count = pJFunc->GetArrayLength(currentCallEnv(), methods);
-    if (count > 4096)
-    {
-        count = 4096;
-    }
-    static jmethodID methodGetName = nullptr;
-    for (jsize i = 0; i < count; ++i)
-    {
-        jobject method = pJFunc->GetObjectArrayElement(currentCallEnv(), methods, i);
-        if (method == nullptr)
-        {
-            continue;
-        }
-        jmethodID id = pJFunc->FromReflectedMethod(currentCallEnv(), method);
-        if (id == (jmethodID)methodId)
-        {
-            jclass methodClass = pJFunc->GetObjectClass(currentCallEnv(), method);
-            if (methodClass != nullptr)
-            {
-                if (methodGetName == nullptr)
-                {
-                    methodGetName = pJFunc->GetMethodID(currentCallEnv(), methodClass, "getName",
-                                                       "()Ljava/lang/String;");
-                }
-                if (methodGetName != nullptr)
-                {
-                    jstring jname = (jstring)pJFunc->CallObjectMethod(currentCallEnv(), methodClass, methodGetName);
-                    if (jname != nullptr)
-                    {
-                        const char* utf = pJFunc->GetStringUTFChars(currentCallEnv(), jname, nullptr);
-                        if (utf != nullptr)
-                        {
-                            snprintf(out, size, "%s", utf);
-                            pJFunc->ReleaseStringUTFChars(currentCallEnv(), jname, utf);
-                            pJFunc->DeleteLocalRef(currentCallEnv(), jname);
-                            pJFunc->DeleteLocalRef(currentCallEnv(), methodClass);
-                            pJFunc->DeleteLocalRef(currentCallEnv(), method);
-                            return out[0] != 0;
-                        }
-                        pJFunc->DeleteLocalRef(currentCallEnv(), jname);
-                    }
-                }
-                pJFunc->DeleteLocalRef(currentCallEnv(), methodClass);
-            }
-        }
-        pJFunc->DeleteLocalRef(currentCallEnv(), method);
-    }
-    return false;
-}
-
 /*
- * 解析 jmethodID 对应的方法名。
- * targetIsClass=true 时 target 直接当作 jclass(静态调用/已拿到jclass)，
- * 否则把 target 当 jobject 用 GetObjectClass 取类。
- * 先查缓存(GetMethodID时已记录)，未命中再用 Class 反射反查。
+ * 解析 jmethodID 对应的方法名：只查缓存表。
+ * 缓存由JNIEnv函数表hook(GetMethodID/GetStaticMethodID)填充，
+ * trace时不做任何JNI反射，命中不了就输出 <unknown>。
  */
-static bool resolveMethodName(uint64_t methodId, uint64_t target, bool targetIsClass,
-                              char* out, size_t size)
+static bool resolveMethodName(uint64_t methodId, char* out, size_t size)
 {
     if (out == nullptr || size == 0)
     {
         return false;
     }
     out[0] = 0;
-    if (methodId == 0 || currentCallEnv() == nullptr || pJFunc == nullptr)
+    if (methodId == 0)
     {
         return false;
     }
-    if (lookupMethodName(methodId, out, size))
-    {
-        return true;
-    }
-    //方法名缓存不需要JNI，反射反查才需要，关闭解析时直接返回
-    if (!jniResolveEnabled)
-    {
-        return false;
-    }
-    if (g_method_name_failed.find(methodId) != g_method_name_failed.end())
-    {
-        return false;
-    }
-    if (g_method_reflect_budget <= 0)
-    {
-        return false;
-    }
-    //反射本身会调用JNI，避免被自己的回调再次捕获导致递归
-    static thread_local bool resolving = false;
-    if (resolving)
-    {
-        return false;
-    }
-    struct ResolveGuard {
-        bool& flag;
-        explicit ResolveGuard(bool& f) : flag(f) { flag = true; }
-        ~ResolveGuard() { flag = false; }
-    } guard(resolving);
-    if (pJFunc->ExceptionCheck(currentCallEnv()))
-    {
-        return false;
-    }
-    --g_method_reflect_budget;
-
-    jclass clazz = targetIsClass ? (jclass)target
-                                 : (jclass)pJFunc->GetObjectClass(currentCallEnv(), (jobject)target);
-    bool ok = false;
-    if (clazz != nullptr)
-    {
-        //getDeclaredMethods/getMethods 是 java.lang.Class 的方法，必须从 Class 类上取 methodID
-        static jclass classClass = nullptr;
-        static jmethodID getDeclaredMethods = nullptr;
-        static jmethodID getMethods = nullptr;
-        if (classClass == nullptr)
-        {
-            jclass localClass = pJFunc->FindClass(currentCallEnv(), "java/lang/Class");
-            if (localClass != nullptr)
-            {
-                classClass = (jclass)pJFunc->NewGlobalRef(currentCallEnv(), localClass);
-                pJFunc->DeleteLocalRef(currentCallEnv(), localClass);
-            }
-        }
-        if (classClass != nullptr)
-        {
-            if (getDeclaredMethods == nullptr)
-            {
-                getDeclaredMethods = pJFunc->GetMethodID(currentCallEnv(), classClass, "getDeclaredMethods",
-                                                         "()[Ljava/lang/reflect/Method;");
-            }
-            if (getMethods == nullptr)
-            {
-                getMethods = pJFunc->GetMethodID(currentCallEnv(), classClass, "getMethods",
-                                                 "()[Ljava/lang/reflect/Method;");
-            }
-        }
-        if (getDeclaredMethods != nullptr)
-        {
-            jobjectArray arr = (jobjectArray)pJFunc->CallObjectMethod(currentCallEnv(), clazz, getDeclaredMethods);
-            ok = scanMethodArray(arr, methodId, out, size);
-            if (arr != nullptr)
-            {
-                pJFunc->DeleteLocalRef(currentCallEnv(), arr);
-            }
-        }
-        if (!ok && getMethods != nullptr)
-        {
-            jobjectArray arr = (jobjectArray)pJFunc->CallObjectMethod(currentCallEnv(), clazz, getMethods);
-            ok = scanMethodArray(arr, methodId, out, size);
-            if (arr != nullptr)
-            {
-                pJFunc->DeleteLocalRef(currentCallEnv(), arr);
-            }
-        }
-        if (!targetIsClass)
-        {
-            pJFunc->DeleteLocalRef(currentCallEnv(), clazz);
-        }
-    }
-    if (ok)
-    {
-        g_method_names[methodId] = out;
-    }
-    else
-    {
-        g_method_name_failed[methodId] = true;
-        clearPendingException();
-    }
-    return ok;
+    return lookupMethodName(methodId, out, size);
 }
 
 /* 输出 "method = toString"，解析不到时输出 <unknown> */
-static void appendMethodLine(uint64_t methodId, uint64_t target, bool targetIsClass)
+static void appendMethodLine(uint64_t methodId)
 {
     char name[128] = {0};
-    if (resolveMethodName(methodId, target, targetIsClass, name, sizeof(name)))
+    if (resolveMethodName(methodId, name, sizeof(name)))
     {
         appendformat("      method = %s\n", name);
     }
@@ -688,13 +954,21 @@ static void appendMethodLine(uint64_t methodId, uint64_t target, bool targetIsCl
     }
 }
 
-/* 输出 "field = mField"，来自 GetFieldID 时记录的缓存 */
+/* 输出 "field = mField"，来自 GetFieldID/GetStaticFieldID hook记录的缓存 */
 static void appendFieldLine(uint64_t fieldId)
 {
-    auto it = g_field_names.find(fieldId);
-    if (it != g_field_names.end() && !it->second.empty())
+    std::string name;
     {
-        appendformat("      field = %s\n", it->second.c_str());
+        std::lock_guard<std::mutex> lock(g_jni_name_mutex);
+        auto it = g_field_names.find(fieldId);
+        if (it != g_field_names.end())
+        {
+            name = it->second;
+        }
+    }
+    if (!name.empty())
+    {
+        appendformat("      field = %s\n", name.c_str());
     }
     else
     {
@@ -722,6 +996,7 @@ static bool buildCallMethodPrototype(const char* name, char* out, size_t size)
     char type[16] = {0};
     memcpy(type, p, typeLen);
     bool isV = (strcmp(methodPos, "MethodV") == 0);
+    bool isA = (strcmp(methodPos, "MethodA") == 0);
 
     const char* retType = nullptr;
     if (strcmp(type, "Object") == 0)       retType = "jobject";
@@ -739,7 +1014,7 @@ static bool buildCallMethodPrototype(const char* name, char* out, size_t size)
     snprintf(out, size, "%s %s(JNIEnv *env, %s, jmethodID methodID, %s);",
              retType, name,
              isStatic ? "jclass clazz" : (isNonvirtual ? "jobject obj, jclass clazz" : "jobject obj"),
-             isV ? "va_list args" : "...");
+             isV ? "va_list args" : (isA ? "const jvalue *args" : "..."));
     return true;
 }
 
@@ -961,8 +1236,148 @@ static void appendJniPrototype(const char* name)
     }
 }
 
-/* 解析AArch64的va_list，输出前几个可变参数槽位（不再hexdump） */
-static void appendVaList(uint64_t va)
+/* ---------------- 变参解码 ----------------
+ * Call*Method / NewObject 的变参有两种形态：
+ *   V 版本: AArch64 va_list = {void* stack; void* gr_top; void* vr_top; int gr_offs; int vr_offs;}
+ *           通用参数在 gr_top + gr_offs(每槽8字节)，浮点参数在 vr_top + vr_offs(每槽16字节)
+ *   非V版本: 参数直接放在 x3~x7(非虚调用是 x4~x7)
+ *
+ * 关键点：本trace的回调是**调用返回之后**才执行的，此时 ART 已经把 va_list 消费完
+ * (gr_offs/vr_offs 被推进到末尾、__stack 也可能前进)，按结构体里的现成偏移去取只会读到
+ * 保存区之外的脏数据 —— 以前固定读4个槽位，toString()/intern() 这种无参方法打出来的
+ * 就是这么来的垃圾值。所以这里按 AAPCS64 的 va_start 规则还原起始偏移，
+ * 再按被调方法的签名逐个取值(参数个数、类型都以签名为准)：
+ *   gr_offs = -(8 - 命名通用参数个数) * 8     vr_offs = -(8 - 命名浮点参数个数) * 16
+ */
+
+/* 取方法签名(GetMethodID/GetStaticMethodID 时记录)，没有就返回false */
+static bool lookupMethodSig(uint64_t methodId, std::string& out)
+{
+    if (methodId == 0)
+    {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_jni_name_mutex);
+    auto it = g_method_sigs.find(methodId);
+    if (it == g_method_sigs.end() || it->second.empty())
+    {
+        return false;
+    }
+    out = it->second;
+    return true;
+}
+
+/*
+ * 从签名里取下一个参数描述符：*p 指向 '(' 之后(或上一个参数之后)。
+ * 返回参数类型字符：'Z'/'B'/'C'/'S'/'I'/'J'/'F'/'D'，对象和数组统一返回 'L'；
+ * 完整描述符(如 "Ljava/lang/String;"、"[B")拷贝到 desc。签名结束返回 0。
+ */
+static char nextParamDesc(const char** p, char* desc, size_t descSize)
+{
+    if (p == nullptr || *p == nullptr)
+    {
+        return 0;
+    }
+    const char* start = *p;
+    while (**p == '[')
+    {
+        ++(*p);
+    }
+    char kind = **p;
+    if (kind == 0 || kind == ')' || kind == 'V')
+    {
+        return 0;
+    }
+    if (kind == 'L')
+    {
+        const char* end = strchr(*p, ';');
+        if (end == nullptr)
+        {
+            return 0;
+        }
+        *p = end + 1;
+    }
+    else
+    {
+        ++(*p);
+    }
+    if (desc != nullptr && descSize > 0)
+    {
+        size_t len = (size_t)(*p - start);
+        if (len >= descSize)
+        {
+            len = descSize - 1;
+        }
+        memcpy(desc, start, len);
+        desc[len] = 0;
+    }
+    return kind;
+}
+
+/*
+ * 输出一个参数值。arrayDesc 非空表示是数组/对象描述符(如 "[B"、"Ljava/lang/String;")。
+ * floatIsPromoted: C 可变参数里 float 会提升成 double(V版本读到的是 double)，
+ * 而 jvalue 数组里存的是原始 4 字节 float。
+ */
+static void appendJValueArg(char kind, const char* arrayDesc, uint64_t value, bool floatIsPromoted)
+{
+    switch (kind)
+    {
+        case 'Z': appendformat("jboolean %s", value ? "true" : "false"); return;
+        case 'B': appendformat("jbyte %d", (int)(int8_t)(uint8_t)value); return;
+        case 'C': appendformat("jchar 0x%x", (unsigned)(uint16_t)value); return;
+        case 'S': appendformat("jshort %d", (int)(int16_t)(uint16_t)value); return;
+        case 'I': appendformat("jint %d", (int)(int32_t)(uint32_t)value); return;
+        case 'J': appendformat("jlong 0x%lx", value); return;
+        case 'F':
+        {
+            float f = 0;
+            if (floatIsPromoted)
+            {
+                double d = 0;
+                memcpy(&d, &value, sizeof(d));
+                f = (float)d;
+            }
+            else
+            {
+                memcpy(&f, &value, sizeof(f));
+            }
+            appendformat("jfloat %g", (double)f);
+            return;
+        }
+        case 'D':
+        {
+            double d = 0;
+            memcpy(&d, &value, sizeof(d));
+            appendformat("jdouble %g", d);
+            return;
+        }
+        default:
+        {
+            if (arrayDesc != nullptr)
+            {
+                appendformat("%s@0x%lx", arrayDesc, value);
+                return;
+            }
+            char cls[256] = {0};
+            if (value != 0 && resolveJavaClassName(value, cls, sizeof(cls)))
+            {
+                appendformat("%s@0x%lx", cls, value);
+            }
+            else
+            {
+                appendformat("jobject@0x%lx", value);
+            }
+            return;
+        }
+    }
+}
+
+/*
+ * 解析 V 版本。namedGp 是该 JNI 入口的命名通用参数个数：
+ * Call*Method/CallStatic*Method/NewObject* 为 3，CallNonvirtual*Method 为 4。
+ */
+static void appendVaList(uint64_t va, uint64_t methodId, int namedGp)
 {
     if (va == 0)
     {
@@ -983,18 +1398,177 @@ static void appendVaList(uint64_t va)
         appendformat(", args=0x%lx", va);
         return;
     }
-    //可变参数从 gr_top + gr_offs 开始，最多取4个通用参数槽位
-    uint64_t argsAddr = (uint64_t)((int64_t)vaList.gr_top + (int64_t)vaList.gr_offs);
-    uint64_t values[4] = {0};
-    if (safeReadMemory(argsAddr, (uint8_t*)values, sizeof(values)))
+    std::string sig;
+    if (!lookupMethodSig(methodId, sig))
     {
-        appendformat(", args=[0x%lx, 0x%lx, 0x%lx, 0x%lx]",
-                     values[0], values[1], values[2], values[3]);
+        //没有签名就不知道有几个参数：宁可不输出，也不把保存区里的脏槽位当参数打出来
+        appendformat(", args=<sig unknown, va=0x%lx>", va);
+        return;
     }
-    else
+    if (namedGp < 0)
     {
-        appendformat(", args=0x%lx", va);
+        namedGp = 0;
     }
+    if (namedGp > 8)
+    {
+        namedGp = 8;
+    }
+    //va_start 的初值，不能用结构体里已经被消费过的偏移
+    int64_t grOffs = -(int64_t)(8 - namedGp) * 8;
+    int64_t vrOffs = -(int64_t)(8 * 16);     //这些JNI入口没有浮点命名参数
+    const uint64_t grBase = vaList.gr_top;
+    const uint64_t vrBase = vaList.vr_top;
+
+    appendlog(", args=[");
+    const char* p = sig.c_str();
+    if (*p == '(')
+    {
+        ++p;
+    }
+    int count = 0;
+    while (true)
+    {
+        char desc[64] = {0};
+        char kind = nextParamDesc(&p, desc, sizeof(desc));
+        if (kind == 0)
+        {
+            break;
+        }
+        uint64_t value = 0;
+        bool ok = false;
+        if (kind == 'F' || kind == 'D')
+        {
+            if (vrOffs < 0 &&
+                safeReadMemory((uint64_t)((int64_t)vrBase + vrOffs), (uint8_t*)&value, sizeof(value)))
+            {
+                vrOffs += 16;
+                ok = true;
+            }
+        }
+        else if (grOffs < 0 &&
+                 safeReadMemory((uint64_t)((int64_t)grBase + grOffs), (uint8_t*)&value, sizeof(value)))
+        {
+            grOffs += 8;
+            ok = true;
+        }
+        if (count > 0)
+        {
+            appendlog(", ");
+        }
+        if (!ok)
+        {
+            //参数超过寄存器槽位(落到栈上)或内存读不到
+            appendlog("...");
+            break;
+        }
+        appendJValueArg(kind, desc[0] == '[' ? desc : nullptr, value, true);
+        ++count;
+    }
+    appendlog("]");
+}
+
+/*
+ * 解析非V版本(可变参数直接放在寄存器里)：从 x{firstIdx} 开始。
+ * 浮点参数在 v0~v7，回调只拿到GPR状态，取不到值，只能标出位置。
+ */
+static void appendRegArgs(QBDI::GPRState *gprState, int firstIdx, uint64_t methodId)
+{
+    std::string sig;
+    if (!lookupMethodSig(methodId, sig))
+    {
+        //没有签名：退化成原始寄存器槽位，明确标出是猜的
+        for (int i = firstIdx; i <= 7; ++i)
+        {
+            appendformat(", arg%d=0x%lx", i - firstIdx, QBDI_GPR_GET(gprState, i));
+        }
+        return;
+    }
+    appendlog(", args=[");
+    const char* p = sig.c_str();
+    if (*p == '(')
+    {
+        ++p;
+    }
+    int gp = firstIdx;
+    int fp = 0;
+    int count = 0;
+    while (true)
+    {
+        char desc[64] = {0};
+        char kind = nextParamDesc(&p, desc, sizeof(desc));
+        if (kind == 0)
+        {
+            break;
+        }
+        if (count > 0)
+        {
+            appendlog(", ");
+        }
+        if (kind == 'F' || kind == 'D')
+        {
+            appendformat("j%s <in v%d>", kind == 'F' ? "float" : "double", fp);
+            ++fp;
+        }
+        else if (gp <= 7)
+        {
+            appendJValueArg(kind, desc[0] == '[' ? desc : nullptr, QBDI_GPR_GET(gprState, gp), true);
+            ++gp;
+        }
+        else
+        {
+            appendlog("...");
+            break;
+        }
+        ++count;
+    }
+    appendlog("]");
+}
+
+/* 解析 A 版本：const jvalue* 是连续的 8 字节 union 数组，按签名顺序读 */
+static void appendJValues(uint64_t ptr, uint64_t methodId)
+{
+    if (ptr == 0)
+    {
+        appendlog(", jvalues=0x0");
+        return;
+    }
+    std::string sig;
+    if (!lookupMethodSig(methodId, sig))
+    {
+        appendformat(", jvalues=0x%lx", ptr);
+        return;
+    }
+    appendlog(", args=[");
+    const char* p = sig.c_str();
+    if (*p == '(')
+    {
+        ++p;
+    }
+    int count = 0;
+    while (true)
+    {
+        char desc[64] = {0};
+        char kind = nextParamDesc(&p, desc, sizeof(desc));
+        if (kind == 0)
+        {
+            break;
+        }
+        uint64_t value = 0;
+        bool ok = safeReadMemory(ptr + (uint64_t)count * sizeof(jvalue),
+                                 (uint8_t*)&value, sizeof(value));
+        if (count > 0)
+        {
+            appendlog(", ");
+        }
+        if (!ok)
+        {
+            appendlog("...");
+            break;
+        }
+        appendJValueArg(kind, desc[0] == '[' ? desc : nullptr, value, false);
+        ++count;
+    }
+    appendlog("]");
 }
 
 /* 根据函数名输出JNI返回值(x0)，Object类型额外解析java类名 */
@@ -1302,7 +1876,8 @@ void trace_NewString(QBDI::VM *vm, QBDI::GPRState *gprState)
     uint64_t len = QBDI_GPR_GET(gprState, 2);
     appendformat("  [JNI] NewString(unicode=0x%lx, len=0x%lx)\n", unicode, len);
     appendJniPrototype("NewString");
-    appendformat("      return x0 = 0x%lx\n", (uint64_t)g_deferred_call_retval);
+    cacheKnownRefClass((uint64_t)g_deferred_call_retval, "java.lang.String");
+    appendformat("      return x0 = 0x%lx (java.lang.String)\n", (uint64_t)g_deferred_call_retval);
 }
 
 void trace_NewStringUTF(QBDI::VM *vm, QBDI::GPRState *gprState)
@@ -1316,14 +1891,17 @@ void trace_NewStringUTF(QBDI::VM *vm, QBDI::GPRState *gprState)
     appendStringArg(bytes);
     appendlog(")\n");
     appendJniPrototype("NewStringUTF");
-    appendformat("      return x0 = 0x%lx\n", (uint64_t)g_deferred_call_retval);
+    //NewStringUTF 返回的一定是 java.lang.String：直接记下，句柄被复用也不会显示成别的类
+    cacheKnownRefClass((uint64_t)g_deferred_call_retval, "java.lang.String");
+    appendformat("      return x0 = 0x%lx (java.lang.String)\n", (uint64_t)g_deferred_call_retval);
 }
 
 /*
  * Call*Method / CallStatic*Method 系列通用回调。
  * 函数名由注册时传入(addJNITrace)，延迟回调执行前会写入 g_deferred_call_name。
  *  - JNIEnv*: x0, jobject/jclass: x1, jmethodID: x2
- *  - V 版本: x3 = va_list；非V版本: x3~x7 就是可变参数
+ *  - V 版本: x3 = va_list；A 版本: x3 = const jvalue*；非V版本: x3~x7 就是可变参数
+ *  - 变参按 GetMethodID 记下的方法签名解码(appendVaList/appendJValues/appendRegArgs)
  * 输出: 参数行 -> 函数原型 -> obj/clazz解析出的java类 -> 返回值
  */
 void trace_CallMethod(QBDI::VM *vm, QBDI::GPRState *gprState)
@@ -1336,6 +1914,7 @@ void trace_CallMethod(QBDI::VM *vm, QBDI::GPRState *gprState)
     bool isStatic = (strncmp(name, "CallStatic", 10) == 0);
     size_t nameLen = strlen(name);
     bool isVaList = (nameLen > 0 && name[nameLen - 1] == 'V');
+    bool isJvalues = (nameLen > 0 && name[nameLen - 1] == 'A');
 
     uint64_t env = QBDI_GPR_GET(gprState, 0);
     uint64_t obj = QBDI_GPR_GET(gprState, 1);
@@ -1346,22 +1925,23 @@ void trace_CallMethod(QBDI::VM *vm, QBDI::GPRState *gprState)
                  name, env, isStatic ? "clazz" : "obj", obj, methodId);
     if (isVaList)
     {
-        appendVaList(args);
+        //V版本: x3 是 va_list，按方法签名解码
+        appendVaList(args, methodId, 3);
+    }
+    else if (isJvalues)
+    {
+        //A版本: x3 是 const jvalue*，按方法签名逐个读
+        appendJValues(args, methodId);
     }
     else
     {
-        //非V版本可变参数直接放在x3~x7
-        appendformat(", arg0=0x%lx, arg1=0x%lx, arg2=0x%lx, arg3=0x%lx, arg4=0x%lx",
-                     args,
-                     QBDI_GPR_GET(gprState, 4),
-                     QBDI_GPR_GET(gprState, 5),
-                     QBDI_GPR_GET(gprState, 6),
-                     QBDI_GPR_GET(gprState, 7));
+        //非V版本: 可变参数直接在 x3~x7 里
+        appendRegArgs(gprState, 3, methodId);
     }
     appendlog(")\n");
     appendJniPrototype(name);
     appendJavaClassLine(isStatic ? "clazz" : "obj", obj);
-    appendMethodLine(methodId, obj, isStatic);
+    appendMethodLine(methodId);
     appendJniReturn(name, (uint64_t)g_deferred_call_retval);
 }
 
@@ -1463,25 +2043,28 @@ void trace_NewObject(QBDI::VM *vm, QBDI::GPRState *gprState)
         appendformat(", methodID=0x%lx", methodId);
         if (strcmp(name, "NewObjectV") == 0)
         {
-            appendVaList(args);
+            appendVaList(args, methodId, 3);
         }
         else if (strcmp(name, "NewObjectA") == 0)
         {
-            appendformat(", jvalues=0x%lx", args);
+            appendJValues(args, methodId);
         }
         else
         {
-            appendformat(", arg0=0x%lx, arg1=0x%lx, arg2=0x%lx, arg3=0x%lx, arg4=0x%lx",
-                         args,
-                         QBDI_GPR_GET(gprState, 4),
-                         QBDI_GPR_GET(gprState, 5),
-                         QBDI_GPR_GET(gprState, 6),
-                         QBDI_GPR_GET(gprState, 7));
+            appendRegArgs(gprState, 3, methodId);
         }
     }
     appendlog(")\n");
     appendJniPrototype(name);
     appendJavaClassLine("clazz", clazz);
+    //NewObject/AllocObject 返回的一定是 clazz 的实例：按类名直接记账，句柄复用也不会串类
+    {
+        char cls[256] = {0};
+        if (g_deferred_call_retval != 0 && resolveJavaClassName(clazz, cls, sizeof(cls)))
+        {
+            cacheKnownRefClass((uint64_t)g_deferred_call_retval, cls);
+        }
+    }
     if (strcmp(name, "AllocObject") != 0)
     {
         //构造方法名一般是<init>，在GetMethodID阶段已经缓存
@@ -1517,9 +2100,21 @@ void trace_ReferenceFunc(QBDI::VM *vm, QBDI::GPRState *gprState)
         appendformat("  [JNI] %s(ref=0x%lx)\n", name, x1);
     }
     appendJniPrototype(name);
-    if (strcmp(name, "DeleteGlobalRef") != 0 && strcmp(name, "DeleteWeakGlobalRef") != 0)
+    if (strcmp(name, "DeleteGlobalRef") == 0 || strcmp(name, "DeleteWeakGlobalRef") == 0)
+    {
+        //句柄已经被ART回收，后面可能复用给别的对象/类，类信息一起删掉(纯查表，不调JNI)
+        forgetRefClass(x1);
+    }
+    else
     {
         appendJniReturn(name, (uint64_t)g_deferred_call_retval);
+        if ((strcmp(name, "NewGlobalRef") == 0 || strcmp(name, "NewLocalRef") == 0) &&
+            g_deferred_call_retval != 0)
+        {
+            //新句柄的值和源引用不相等，把源引用上的类信息继承过来，trace时才能显示类名
+            linkRefClassName(x1, (uint64_t)g_deferred_call_retval);
+            appendJavaClassLine("ref", (uint64_t)g_deferred_call_retval);
+        }
     }
 }
 
@@ -1790,22 +2385,28 @@ void trace_CallNonvirtualMethod(QBDI::VM *vm, QBDI::GPRState *gprState)
     uint64_t methodId = QBDI_GPR_GET(gprState, 3);
     size_t nameLen = strlen(name);
     bool isVaList = (nameLen > 0 && name[nameLen - 1] == 'V');
+    bool isJvalues = (nameLen > 0 && name[nameLen - 1] == 'A');
     appendformat("  [JNI] %s(obj=0x%lx, clazz=0x%lx, methodID=0x%lx", name, obj, clazz, methodId);
     if (isVaList)
     {
-        appendVaList(QBDI_GPR_GET(gprState, 4));
+        //非虚调用多一个 jclass 命名参数(env/obj/clazz/methodID)，va_list 从 x4 开始
+        appendVaList(QBDI_GPR_GET(gprState, 4), methodId, 4);
+    }
+    else if (isJvalues)
+    {
+        //A版本x4是const jvalue*
+        appendJValues(QBDI_GPR_GET(gprState, 4), methodId);
     }
     else
     {
-        appendformat(", arg0=0x%lx, arg1=0x%lx, arg2=0x%lx, arg3=0x%lx",
-                     QBDI_GPR_GET(gprState, 4), QBDI_GPR_GET(gprState, 5),
-                     QBDI_GPR_GET(gprState, 6), QBDI_GPR_GET(gprState, 7));
+        //非虚调用参数从 x4 开始
+        appendRegArgs(gprState, 4, methodId);
     }
     appendlog(")\n");
     appendJniPrototype(name);
     appendJavaClassLine("obj", obj);
     appendJavaClassLine("clazz", clazz);
-    appendMethodLine(methodId, clazz, true);
+    appendMethodLine(methodId);
     appendJniReturn(name, (uint64_t)g_deferred_call_retval);
 }
 
@@ -1829,6 +2430,40 @@ void trace_GenericJni(QBDI::VM *vm, QBDI::GPRState *gprState)
     appendformat("      return x0 = 0x%lx\n", (uint64_t)g_deferred_call_retval);
 }
 
+/* 重新同步trace表时不需要打印"已注册"的日志 */
+static bool g_jni_trace_quiet = false;
+
+void setJNITraceQuiet(bool quiet)
+{
+    g_jni_trace_quiet = quiet;
+}
+
+/* 注册一个JNI trace地址(地址 -> 回调)，已注册过则跳过 */
+static void addJNITraceEntry(void* target, const char* funcname, TraceCallBack callback)
+{
+    if (target == nullptr)
+    {
+        return;
+    }
+    auto it = _g_jni_trace->map.find((size_t)target);
+    if (it != _g_jni_trace->map.end())
+    {
+        if (!g_jni_trace_quiet)
+        {
+            LOGE("jnitrace: %p has installed!", target);
+        }
+        return;
+    }
+    auto* jni_trace_func = new TraceFunc();
+    jni_trace_func->callback = callback;
+    jni_trace_func->name = funcname;
+    _g_jni_trace->map[(size_t)target] = jni_trace_func;
+    if (!g_jni_trace_quiet)
+    {
+        LOGE("jnitrace: %s,%p install", funcname, target);
+    }
+}
+
 void addJNITrace(void* target,const char* funcname,TraceCallBack callback)
 {
     if(_g_jni_trace == nullptr)
@@ -1836,17 +2471,14 @@ void addJNITrace(void* target,const char* funcname,TraceCallBack callback)
         LOGE("jnitrace: not init!");
         return;
     }
-    auto it = _g_jni_trace->map.find((size_t)target);
-    if(it != _g_jni_trace->map.end())
+    //Get*ID被解析hook接管时，目标代码通过函数表拿到的是我们的hook地址:
+    //原始ART地址和hook地址都注册，bl直接调用和blr间接调用都能命中同一个回调
+    void* orig = jniOriginalFunc(target);
+    addJNITraceEntry(orig, funcname, callback);
+    if (orig != target)
     {
-        LOGE("jnitrace: %p has installed!",target);
-        return;
+        addJNITraceEntry(target, funcname, callback);
     }
-    auto* jni_trace_func = new TraceFunc();
-    jni_trace_func->callback = callback;
-    jni_trace_func->name = funcname;
-    _g_jni_trace->map[(size_t)target] = jni_trace_func;
-    LOGE("jnitrace: %s,%p install",funcname,target);
 }
 
 void setup_jfunc(JNIEnv * jnienv)

@@ -83,6 +83,11 @@ void appendlogendl()
 
 void appendformat(const char* format,...)
 {
+    //没有logger时直接丢弃，避免trace收尾/回调时序异常时空指针崩溃
+    if(_logger == nullptr)
+    {
+        return;
+    }
     va_list ap;
     va_start(ap, format);
     _logger->buf = sdscatvprintf(_logger->buf,format,ap);

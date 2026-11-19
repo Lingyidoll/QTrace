@@ -38,6 +38,14 @@ int bufsize = 0x1000000;
 int bufstate = 0;
 bool debugInsn = false;
 
+/* bit4(TRACE_CFG_STOP_BEFORE_ART) 命中时为true：本次trace没有跑完，是主动停的 */
+static bool g_stopped_at_cross = false;
+
+bool trace_stopped_at_cross()
+{
+    return g_stopped_at_cross;
+}
+
 
 void setBufferSize(int size)
 {
@@ -46,12 +54,14 @@ void setBufferSize(int size)
      *   bit7 .. bit0   : 配置状态，按 initTraceEnv 里 enable_* 的调用顺序从bit0开始:
      *                    bit0 enableDebugInsn        (逐指令日志)
      *                    bit1 enable_jni_trace_debug (jni trace)
-     *                    bit2 enable_jni_resolve     (obj类名/method名称解析)
+     *                    bit2 enable_jni_resolve     (obj类名解析，method/field名始终由hook记录)
      *                    bit3 enable_libc_trace_debug(libc trace)
+     *                    bit4 TRACE_CFG_STOP_BEFORE_ART(安全模式：进ART/未知模块前停止trace)
      *   bit31.. bit8   : 累计写盘阈值，等价字节数 = 值 & 0xFFFFFF00
      * 例如:
      *   0x10000000 = 256MB, state=0x00
-     *   0x1000000A = 256MB, state=0x0A (jni trace + libc trace 开启)
+     *   0x1000001A = 256MB, state=0x1A (jni trace + libc trace + 跨模块调用前停止)
+     *   0x1000001E = 256MB, state=0x1E (额外打开obj类名解析)
      * 阈值部分为0时表示每 trace 一条指令就写入本地。
      */
     uint32_t value = (uint32_t)size;
@@ -65,16 +75,19 @@ void setBufferSize(int size)
     bufsize = (int)bytes;
 
     //低8位配置状态直接应用到对应开关
+    // 逐条打印
     enableDebugInsn((bufstate & (1 << 0)) != 0);
     enable_jni_trace_debug((bufstate & (1 << 1)) != 0);
+    // 解析类名和methodId
     enable_jni_resolve((bufstate & (1 << 2)) != 0);
     enable_libc_trace_debug((bufstate & (1 << 3)) != 0);
 
     LOGE("setBufferSize: raw=0x%x, state=0x%x, flushThreshold=%u bytes(%u MB)",
          value, (unsigned)bufstate, bytes, bytes >> 20);
-    LOGE("trace config: debugInsn=%d, jniTrace=%d, jniResolve=%d, libcTrace=%d",
+    LOGE("trace config: debugInsn=%d, jniTrace=%d, jniResolve=%d, libcTrace=%d, stopAtCrossModule=%d",
          (bufstate & (1 << 0)) ? 1 : 0, (bufstate & (1 << 1)) ? 1 : 0,
-         (bufstate & (1 << 2)) ? 1 : 0, (bufstate & (1 << 3)) ? 1 : 0);
+         (bufstate & (1 << 2)) ? 1 : 0, (bufstate & (1 << 3)) ? 1 : 0,
+         (bufstate & TRACE_CFG_STOP_BEFORE_ART) ? 1 : 0);
 }
 
 void enableDebugInsn(bool enable)
@@ -106,6 +119,8 @@ struct PendingInst {
     int  numRegs = 0;
     char memInfo[1024];      // 内存访问行(可能多条)
     int  memLen = 0;
+    char syscallInfo[256];   // syscall行(svc: 系统调用号+参数)，紧跟指令行输出
+    int  syscallLen = 0;
     char callHead[512];      // Call addr（已hook函数只输出 "Call addr: "，参数行由回调补全）
     int  callHeadLen = 0;
     TraceCallBack deferredCb = nullptr;  // jni/libc trace回调，延迟到调用行之后执行
@@ -179,6 +194,9 @@ static void flushPending(QBDI::VM *vm, QBDI::GPRState *gprState)
         appendlog_n(wbuf, woff);
     }
     appendlogendl();
+    if (pending.syscallLen > 0) {
+        appendlog_n(pending.syscallInfo, pending.syscallLen);
+    }
     if (pending.memLen > 0) {
         appendlog_n(pending.memInfo, pending.memLen);
     }
@@ -263,6 +281,11 @@ static bool getExecRangeOfAddr(size_t addr, size_t &start, size_t &end)
 static std::mutex g_trace_mutex;
 static thread_local bool g_tracing = false;
 
+bool is_trace_running()
+{
+    return g_tracing;
+}
+
 size_t trace_call(void *func_addr, const size_t *args, size_t arg_num, const char *log_path)
 {
     LOGE("trace_call enter:%p,arg_num:%zu,log:%s", func_addr, arg_num,
@@ -344,15 +367,27 @@ size_t trace_call(void *func_addr, const size_t *args, size_t arg_num, const cha
     QBDI_GPR_SET(qbdi_state, QBDI::REG_SP, sp - stack_size);
     QBDI_GPR_SET(qbdi_state, QBDI::REG_BP, QBDI_GPR_GET(qbdi_state, QBDI::REG_SP));
     QBDI::rword qbdi_retval = 0;
+    g_stopped_at_cross = false;
     LOGE("trace begin");
     //参数按AAPCS64约定通过x0~x7传入
     bool qbdi_success = qvm.callA(&qbdi_retval, (QBDI::rword)function_address,
                                   (uint32_t)arg_num,
                                   reinterpret_cast<const QBDI::rword *>(args));
     LOGE("trace end");
+    /*
+     * 诊断日志：目标函数的返回值/调用是否成功/SP是否被完好恢复。
+     * 典型场景：加固so的 JNI_OnLoad 在QBDI下可能返回非法版本号(0)，ART会判定loadLibrary失败，
+     * 接着在构造 UnsatisfiedLinkError 时走 StackVisitor 遍历被QBDI改写过的栈而崩溃。
+     */
+    LOGE("trace result: success=%d, retval=0x%lx, sp=0x%lx(expected 0x%lx)",
+         qbdi_success ? 1 : 0, (uint64_t)qbdi_retval,
+         (uint64_t)QBDI_GPR_GET(qbdi_state, QBDI::REG_SP), (uint64_t)(sp - stack_size));
     flushPending(nullptr, qbdi_state);
     writelog();
-    if (qbdi_success) {
+    if (g_stopped_at_cross) {
+        LOGE("trace stopped by TRACE_CFG_STOP_BEFORE_ART(bit4): target code was about to enter ART,"
+             " caller must run the real function natively, log:%s", _logger->logfile.c_str());
+    } else if (qbdi_success) {
         LOGE("trace completed successfully %s",_logger->logfile.c_str());
     } else {
         LOGE("trace failed");
@@ -365,6 +400,10 @@ size_t trace_call(void *func_addr, const size_t *args, size_t arg_num, const cha
     deleteLogger();
     delete vm_;
     g_tracing = false;
+    if (g_stopped_at_cross) {
+        //目标函数没跑完，返回值没有意义：返回0，由调用方用原生执行的结果
+        return 0;
+    }
     return qbdi_success ? (size_t)qbdi_retval : 0;
 }
 
@@ -428,7 +467,7 @@ static int appf(char* out, size_t size, int off, const char* fmt, ...)
     return (off + n < (int)size) ? off + n : (int)size - 1;
 }
 
-/* 取模块短名: /apex/com.android.art/lib64/libart.so -> libart.so */
+/*! 取模块短名: /apex/com.android.art/lib64/libart.so -> libart.so */
 static void moduleShortName(const char* path, char* buf, size_t size)
 {
     if (path == nullptr || path[0] == '\0')
@@ -438,6 +477,23 @@ static void moduleShortName(const char* path, char* buf, size_t size)
     }
     const char* p = strrchr(path, '/');
     snprintf(buf, size, "%s", p != nullptr ? p + 1 : path);
+}
+
+/*
+ * 是不是 ART 相关模块。
+ * QBDI 的"重放"上下文里执行 ART 代码是危险的（JNI 引用/ArtMethod 解引用会崩），
+ * 而 libc / 其它普通 so 只是普通 native 代码，可以照常执行。
+ */
+static bool isArtModuleName(const char* path)
+{
+    if (path == nullptr)
+    {
+        return false;
+    }
+    return strstr(path, "libart.so") != nullptr ||
+           strstr(path, "libartbase") != nullptr ||
+           strstr(path, "libnativehelper") != nullptr ||
+           strstr(path, "libopenjdkjvm") != nullptr;
 }
 
 /* 调用信息头部:
@@ -476,18 +532,36 @@ static int buildCallHead(char* out, size_t size, uint64_t target, const char* ho
 
 static size_t lastAddr = 0;
 
+/* 声明放在文件靠前，trace_call 里要用（定义在 showPreInstruction 上方） */
+
 static unordered_map<uint32_t,char*> disassemblecache;
 
 // 显示指令执行前的寄存器状态
 QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::FPRState *fprState, void *data)
 {
     auto thiz = (class vm *)data;
+    /* 本条指令是否是"进ART/未知模块"的调用/跳转且开启了 bit4(TRACE_CFG_STOP_BEFORE_ART) */
+    bool stopAfterThis = false;
 
     //上一条指令的信息全部拿到了，写入
     flushPending(vm, gprState);
 
-    // 获取当前指令的分析信息
-    const QBDI::InstAnalysis *instAnalysis = vm->getInstAnalysis(QBDI::ANALYSIS_INSTRUCTION  | QBDI::ANALYSIS_OPERANDS);
+    /*
+     * 指令分析只能取一次，三种信息一起要。
+     * QBDI 把分析结果缓存在 VM 内部的同一份 InstAnalysis 上：
+     * 再调用一次 getInstAnalysis(别的类型) 会把上一次返回结构里的
+     * operands / disassembly 覆盖掉，原来那个指针就失效了。
+     * 旧代码先要 INSTRUCTION|OPERANDS、再要 DISASSEMBLY，然后继续读
+     * instAnalysis->operands[i].regName，读到的是野指针 ——
+     * 表现就是 "access violation accessing 0x7040xxxx" 这种随机堆地址崩溃。
+     */
+    const QBDI::InstAnalysis *instAnalysis = vm->getInstAnalysis(
+            QBDI::ANALYSIS_INSTRUCTION | QBDI::ANALYSIS_OPERANDS | QBDI::ANALYSIS_DISASSEMBLY);
+    if (instAnalysis == nullptr || instAnalysis->address == 0)
+    {
+        LOGE("preinst: getInstAnalysis fail");
+        return QBDI::VMAction::CONTINUE;
+    }
     uint32_t bytecode = *(uint32_t*)instAnalysis->address;
 
     //用缓存的反汇编，减低开销
@@ -496,10 +570,10 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
     if (it != disassemblecache.end()) {
         disasm = it->second;
     } else {
-        const QBDI::InstAnalysis *full = vm->getInstAnalysis(QBDI::ANALYSIS_DISASSEMBLY);
-        size_t len = strlen(full->disassembly) + 1;
+        const char *fullDisasm = instAnalysis->disassembly != nullptr ? instAnalysis->disassembly : "";
+        size_t len = strlen(fullDisasm) + 1;
         disasm = (char*)malloc(len);
-        memcpy(disasm, full->disassembly, len);
+        memcpy(disasm, fullDisasm, len);
         disassemblecache.emplace(bytecode, disasm);
     }
 
@@ -508,6 +582,7 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
 
     pending.numRegs = 0;
     pending.memLen = 0;
+    pending.syscallLen = 0;
     pending.callHeadLen = 0;
     pending.deferredCb = nullptr;
     pending.deferredCbName = nullptr;
@@ -599,28 +674,97 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
                              targetInfo.dli_fbase != nullptr);
             bool outsideModule = resolved &&
                                  (reinterpret_cast<uint64_t>(targetInfo.dli_fbase) != (uint64_t)thiz->base);
+            /*
+             * 目标是否"离开了被trace模块"：
+             *  - dladdr 能认出来且不是本模块      -> 跨模块
+             *  - dladdr 认不出来(匿名映射/JIT/PLT) -> 再用模块 [start,end) 判一次
+             */
+            bool inModuleRange = (_g_trace_data->end > _g_trace_data->start) &&
+                                 target >= _g_trace_data->start && target < _g_trace_data->end;
+            bool leavesModule = outsideModule || (target == 0) || (!resolved && !inModuleRange);
 
-            if (outsideModule || cb != nullptr)
+            char targetMod[128] = "unknown";
+            uint64_t targetModOff = 0;
+            if (resolved)
             {
-                if (cb != nullptr && !isLibc)
+                if (targetInfo.dli_fname != nullptr)
                 {
-                    //JNI函数不打印 "Call addr:"，直接由回调输出 [JNI] 调用行/原型/返回值
-                    pending.callHeadLen = 0;
+                    moduleShortName(targetInfo.dli_fname, targetMod, sizeof(targetMod));
                 }
-                else
+                targetModOff = target - (uint64_t)targetInfo.dli_fbase;
+            }
+
+            /*
+             * 安全模式(bit4)：进 ART / 未知模块之前停 trace。
+             *
+             * 只拦这类目标的原因：
+             *  - trace_call() 是"重放"：只有 x0~x7 是真的，栈是 sp-0x4000 挪过的，
+             *    x8~x28 也不是调用现场的值。加固so的VM在这份上下文里调 JNI 时，
+             *    ART 会用 VM 缓存里的 jmethodID/jobject 去解引用，落到 linear alloc 的空洞上
+             *    直接 SIGSEGV —— 就是 "Error: access violation accessing 0x7040xxxx"。
+             *  - libc / 其它普通 so 是纯 native 代码，不碰 JNI 引用，照常执行没问题，
+             *    所以 malloc/memcpy/mmap 这些不会被误停，日志能多走一段。
+             * 停止后由 frida 把真实函数原生再跑一遍，保证 app 行为不变。
+             */
+            bool stopHere = false;
+            if ((bufstate & TRACE_CFG_STOP_BEFORE_ART) != 0 && leavesModule)
+            {
+                /*
+                 * 只拦两类目标，别的一律让它跑：
+                 *   1) 已注册的 JNI 函数（进 libart 解引用 jmethodID/jobject，必崩）
+                 *   2) libart/libnativehelper 里的代码
+                 * 目标解析不出模块(dladdr 失败，例如 shadowhook/dobby 的 trampoline 在匿名可执行页)
+                 * 时**不停**，否则会在第一条外部调用处就停住，日志只有几十行。
+                 */
+                bool jniCall = (cb != nullptr && !isLibc);
+                bool artTarget = (target == 0) || isArtModuleName(targetMod);
+                if (jniCall || artTarget)
                 {
-                    //已hook的libc函数只打印 "Call addr: "，函数名和参数由回调紧接着输出
-                    pending.callHeadLen = buildCallHead(pending.callHead, sizeof(pending.callHead),
-                                                        target, cb != nullptr ? traceFunc->name : nullptr);
+                    char why[80] = "";
+                    if (target == 0) {
+                        snprintf(why, sizeof(why), "null target");
+                    } else if (jniCall) {
+                        snprintf(why, sizeof(why), "JNI %s", traceFunc->name != nullptr ? traceFunc->name : "?");
+                    } else {
+                        snprintf(why, sizeof(why), "ART");
+                    }
+                    pending.syscallLen = appf(pending.syscallInfo, sizeof(pending.syscallInfo), 0,
+                                              "  [STOP] %s %s 0x%" PRIx64 " [%s!0x%" PRIx64
+                                              "], stop before entering ART (bit4)\n",
+                                              isCall ? "call" : "jump", why, target, targetMod, targetModOff);
+                    g_stopped_at_cross = true;
+                    stopHere = true;
                 }
             }
-            if (cb != nullptr)
+
+            if (stopHere)
             {
-                pending.deferredCb = cb;
-                pending.deferredCbName = traceFunc->name;
-                pending.libcHooked = isLibc;
-                pending.snapshot = *gprState;
-                pending.hasSnapshot = true;
+                stopAfterThis = true;
+            }
+            else
+            {
+                if (outsideModule || cb != nullptr)
+                {
+                    if (cb != nullptr && !isLibc)
+                    {
+                        //JNI函数不打印 "Call addr:"，直接由回调输出 [JNI] 调用行/原型/返回值
+                        pending.callHeadLen = 0;
+                    }
+                    else
+                    {
+                        //已hook的libc函数只打印 "Call addr: "，函数名和参数由回调紧接着输出
+                        pending.callHeadLen = buildCallHead(pending.callHead, sizeof(pending.callHead),
+                                                            target, cb != nullptr ? traceFunc->name : nullptr);
+                    }
+                }
+                if (cb != nullptr)
+                {
+                    pending.deferredCb = cb;
+                    pending.deferredCbName = traceFunc->name;
+                    pending.libcHooked = isLibc;
+                    pending.snapshot = *gprState;
+                    pending.hasSnapshot = true;
+                }
             }
         }
     }
@@ -640,6 +784,16 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
         writelog();
     }
     lastAddr = instAnalysis->address;
+    if (stopAfterThis)
+    {
+        /*
+         * 主动停止：本条指令是跨模块调用/跳转，bit4 要求不把它搬进 QBDI 执行。
+         * 注意这里 return STOP 后 QBDI 的 run/call 提前返回，
+         * trace_call() 会在 callA() 之后把 pending 这条指令刷完并落盘。
+         */
+        LOGE("preinst: stop before entering ART/unknown 0x%" PRIx64 " (TRACE_CFG_STOP_BEFORE_ART)", (uint64_t)instAnalysis->address);
+        return QBDI::VMAction::STOP;
+    }
     return QBDI::VMAction::CONTINUE;
 }
 
@@ -710,13 +864,29 @@ QBDI::VMAction showMemoryAccess(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::FP
     return QBDI::VMAction::CONTINUE;
 }
 
+/*
+ * syscall trace: AArch64上系统调用统一走 svc 指令, x8=系统调用号, x0~x5=参数。
+ * 这里把调用号/参数记到pending里，由flushPending紧跟在svc指令行之后输出，
+ * 保证 "指令行 -> [SYSCALL] ... -> 返回值(x0在指令后变化)" 的顺序。
+ */
 QBDI::VMAction showSyscall(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::FPRState *fprState, void *data)
 {
     const QBDI::InstAnalysis *instAnalysis = vm->getInstAnalysis(QBDI::ANALYSIS_INSTRUCTION);
-    if (instAnalysis->mnemonic && strcasecmp(instAnalysis->mnemonic, "svc") == 0)
+    if (instAnalysis == nullptr || instAnalysis->mnemonic == nullptr ||
+        strcasecmp(instAnalysis->mnemonic, "svc") != 0 || !pending.valid)
     {
-
+        return QBDI::VMAction::CONTINUE;
     }
+    uint64_t nr = QBDI_GPR_GET(gprState, 8);
+    pending.syscallLen = appf(pending.syscallInfo, sizeof(pending.syscallInfo), 0,
+                              "  [SYSCALL] nr=%lu(0x%lx) x0=0x%lx x1=0x%lx x2=0x%lx x3=0x%lx x4=0x%lx x5=0x%lx\n",
+                              nr, nr,
+                              QBDI_GPR_GET(gprState, 0),
+                              QBDI_GPR_GET(gprState, 1),
+                              QBDI_GPR_GET(gprState, 2),
+                              QBDI_GPR_GET(gprState, 3),
+                              QBDI_GPR_GET(gprState, 4),
+                              QBDI_GPR_GET(gprState, 5));
     return QBDI::VMAction::CONTINUE;
 }
 
@@ -745,9 +915,12 @@ QBDI::VM vm::init(size_t base,size_t target)
     //cid = qvm.addCodeCB(QBDI::POSTINST, showPostInstruction, this);
     //assert(cid != QBDI::INVALID_EVENTID);
 
-    //TODO:syscall trace
-    //cid = qvm.addCodeCB(QBDI::PREINST, showSyscall, this);
-    //assert(cid != QBDI::INVALID_EVENTID);
+    //syscall trace: 只在 svc 指令上记录系统调用号(x8)和参数(x0~x5)
+    cid = qvm.addCodeCB(QBDI::PREINST, showSyscall, this);
+    if(cid == QBDI::INVALID_EVENTID)
+    {
+        LOGE("init vm fail: add syscall callback fail");
+    }
 
     //读写trace
     cid = qvm.addMemAccessCB(MEMORY_READ_WRITE, showMemoryAccess, this);
