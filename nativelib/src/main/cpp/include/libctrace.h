@@ -58,5 +58,10 @@ void libc_mmap(QBDI::VM *vm, QBDI::GPRState *gprState);
 void libc_munmap(QBDI::VM *vm, QBDI::GPRState *gprState);
 void libc_dlsym(QBDI::VM *vm, QBDI::GPRState *gprState);
 void libc_strdup(QBDI::VM *vm, QBDI::GPRState *gprState);
+/* 线程同步函数 */
+void libc_pthread_mutex_lock(QBDI::VM *vm, QBDI::GPRState *gprState);
+void libc_pthread_mutex_unlock(QBDI::VM *vm, QBDI::GPRState *gprState);
+void libc_pthread_rwlock_init(QBDI::VM *vm, QBDI::GPRState *gprState);
+void libc_pthread_rwlock_unlock(QBDI::VM *vm, QBDI::GPRState *gprState);
 
 #endif //QBDI_LIBCTRACE_H

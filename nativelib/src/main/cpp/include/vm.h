@@ -39,14 +39,17 @@ struct g_trace_data{
     size_t end;     // 模块结束地址
 };
 
-extern g_trace_data* _g_trace_data;
-/* 最近一次延迟回调所对应调用的返回值(x0)，供jni/libc回调读取 */
-extern size_t g_deferred_call_retval;
+/* 当前trace目标的模块信息，jni/libc trace回调通过它计算模块内偏移。
+ * thread_local：不同线程各自trace各自的模块；同线程嵌套由 trace_call 保存/恢复。 */
+extern thread_local g_trace_data* _g_trace_data;
+/* 最近一次延迟回调所对应调用的返回值(x0)，供jni/libc回调读取。
+ * thread_local：多个线程同时trace时各用各的返回值，避免串台。 */
+extern thread_local size_t g_deferred_call_retval;
 /* 最近一次延迟回调对应的函数名（注册时传入），供通用回调使用 */
-extern const char* g_deferred_call_name;
+extern thread_local const char* g_deferred_call_name;
 /* 最近一次延迟回调所对应JNI调用的JNIEnv(x0)。
  * JNI局部引用与线程/env绑定，解析obj/method时必须用它，不能用初始化时保存的其他线程env */
-extern void *g_deferred_call_env;
+extern thread_local void *g_deferred_call_env;
 extern int bufsize ;
 /* setBufferSize 低8位保存的配置状态，不参与写盘阈值计算 */
 extern int bufstate;

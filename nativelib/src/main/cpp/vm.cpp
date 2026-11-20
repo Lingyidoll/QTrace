@@ -30,22 +30,27 @@ using namespace QBDI;
 
 /* trace过程中使用的模块信息，jni/libc trace回调通过它计算模块内偏移 */
 static g_trace_data g_trace_data_storage{};
-g_trace_data* _g_trace_data = &g_trace_data_storage;
-size_t g_deferred_call_retval = 0;
-const char* g_deferred_call_name = nullptr;
-void* g_deferred_call_env = nullptr;
+/* thread_local：让不同线程/嵌套trace各看各的模块信息（trace_call 里保存/恢复） */
+thread_local g_trace_data* _g_trace_data = &g_trace_data_storage;
+/* thread_local：多线程/嵌套trace时每个线程各存一份，避免返回值/回调名串台 */
+thread_local size_t g_deferred_call_retval = 0;
+thread_local const char* g_deferred_call_name = nullptr;
+thread_local void* g_deferred_call_env = nullptr;
 int bufsize = 0x1000000;
 int bufstate = 0;
 bool debugInsn = false;
 
 /* bit4(TRACE_CFG_STOP_BEFORE_ART) 命中时为true：本次trace没有跑完，是主动停的 */
-static bool g_stopped_at_cross = false;
+static thread_local bool g_stopped_at_cross = false;
 
 bool trace_stopped_at_cross()
 {
     return g_stopped_at_cross;
 }
 
+/* 上一条已执行指令的地址。thread_local + trace_call 里保存/恢复，支持嵌套trace。
+ * 注意：必须声明在 trace_call 之前（showPreInstruction 里也在用）。 */
+static thread_local size_t lastAddr = 0;
 
 void setBufferSize(int size)
 {
@@ -130,7 +135,8 @@ struct PendingInst {
     bool hasSnapshot = false;
 };
 
-static PendingInst pending;
+/* thread_local：每次trace(含嵌套)各自一份，避免两条日志的 pending 互相覆盖 */
+static thread_local PendingInst pending;
 
 // 记录一个寄存器，同一个寄存器只保留一条（读+写合并为写）
 static void appendRegRec(const char *name, int idx, uint64_t value, bool write, uint64_t forceAfter)
@@ -276,14 +282,17 @@ static bool getExecRangeOfAddr(size_t addr, size_t &start, size_t &end)
     return found;
 }
 
-// trace使用全局的logger/pending/disassemble缓存，这里串行化，
-// 同时禁止同一线程重入，避免trace状态被破坏
-static std::mutex g_trace_mutex;
-static thread_local bool g_tracing = false;
+/*
+ * 支持"同时 trace 多个函数"：
+ *   - 去掉了原来的全局互斥锁和"同线程禁止重入"的限制（由调用方自己保证时序/地址）；
+ *   - 每个trace的 logger / pending / lastAddr / 模块信息 / 反汇编缓存都按线程隔离，
+ *     嵌套trace在 trace_call 进出时保存/恢复，所以两份日志不会互相写乱。
+ */
+static thread_local int g_trace_depth = 0;
 
 bool is_trace_running()
 {
-    return g_tracing;
+    return g_trace_depth > 0;
 }
 
 size_t trace_call(void *func_addr, const size_t *args, size_t arg_num, const char *log_path)
@@ -305,12 +314,6 @@ size_t trace_call(void *func_addr, const size_t *args, size_t arg_num, const cha
         LOGE("trace_call: too many args(%zu), only 8 register args are supported", arg_num);
         return 0;
     }
-    if (g_tracing)
-    {
-        LOGE("trace_call: trace is already running in current thread, skip");
-        return 0;
-    }
-
     size_t function_address = reinterpret_cast<size_t>(func_addr);
     MapItemInfo soinfo = resolveModuleInfo(func_addr);
     if (soinfo.start == 0)
@@ -332,18 +335,46 @@ size_t trace_call(void *func_addr, const size_t *args, size_t arg_num, const cha
         }
     }
 
-    std::lock_guard<std::mutex> lock(g_trace_mutex);
-    g_tracing = true;
+    /*
+     * 允许同时/嵌套 trace 多个函数：不再加锁、不再拒绝重入。
+     * 每次 trace 用自己的一份状态（logger / 模块信息 / pending / lastAddr），
+     * 用一个 RAII guard 在进出时保存与恢复，保证嵌套时外层日志不被写乱。
+     */
+    struct StateGuard
+    {
+        logger*           prev_logger;
+        g_trace_data*     prev_data;
+        g_trace_data      my_data;
+        PendingInst       prev_pending;
+        size_t            prev_lastaddr;
+        bool              prev_stopped;
+        int               prev_depth;
+        ~StateGuard()
+        {
+            _g_trace_data      = prev_data;
+            pending            = prev_pending;
+            lastAddr           = prev_lastaddr;
+            g_stopped_at_cross = prev_stopped;
+            g_trace_depth      = prev_depth;
+            swapLogger(prev_logger);
+        }
+    } guard{currentLogger(), _g_trace_data, {}, pending, lastAddr, g_stopped_at_cross, g_trace_depth};
 
+    g_trace_depth = guard.prev_depth + 1;
+    _g_trace_data = &guard.my_data;
     _g_trace_data->base = soinfo.start;
     _g_trace_data->start = soinfo.start;
     _g_trace_data->end = soinfo.end;
+    pending.valid = false;
+    lastAddr = 0;
+    g_stopped_at_cross = false;
 
     //先创建日志文件：这样即使后面QBDI初始化/执行时崩溃，也能通过日志文件是否存在判断执行到了哪一步
     initLoggerWithPath(log_path,function_address);
-    LOGE("start trace:%p,module:[%p-%p],log:%s", func_addr,
-         (void *)_g_trace_data->start, (void *)_g_trace_data->end,
-         _logger->logfile.c_str());
+    logger* lg = currentLogger();
+    LOGE("start trace:%p,module:[%p-%p],depth=%d,log:%s", func_addr,
+         (void *)_g_trace_data->start, (void *)_g_trace_data->end, g_trace_depth,
+         lg != nullptr ? lg->logfile.c_str() : "?");
     struct timeval start, end;
     gettimeofday(&start, nullptr);
 
@@ -357,7 +388,7 @@ size_t trace_call(void *func_addr, const size_t *args, size_t arg_num, const cha
         writelog();
         deleteLogger();
         delete vm_;
-        g_tracing = false;
+        /* depth/logger/pending 由 StateGuard 析构恢复 */
         return 0;
     }
     vm_->base = _g_trace_data->base;
@@ -384,11 +415,12 @@ size_t trace_call(void *func_addr, const size_t *args, size_t arg_num, const cha
          (uint64_t)QBDI_GPR_GET(qbdi_state, QBDI::REG_SP), (uint64_t)(sp - stack_size));
     flushPending(nullptr, qbdi_state);
     writelog();
+    const char* logfile = lg != nullptr ? lg->logfile.c_str() : "?";
     if (g_stopped_at_cross) {
         LOGE("trace stopped by TRACE_CFG_STOP_BEFORE_ART(bit4): target code was about to enter ART,"
-             " caller must run the real function natively, log:%s", _logger->logfile.c_str());
+             " caller must run the real function natively, log:%s", logfile);
     } else if (qbdi_success) {
-        LOGE("trace completed successfully %s",_logger->logfile.c_str());
+        LOGE("trace completed successfully %s", logfile);
     } else {
         LOGE("trace failed");
     }
@@ -399,7 +431,7 @@ size_t trace_call(void *func_addr, const size_t *args, size_t arg_num, const cha
     LOGI("trace time cost:%lds",elapsed_sec);
     deleteLogger();
     delete vm_;
-    g_tracing = false;
+    /* g_tracing/depth/logger/pending 等由 StateGuard 析构时恢复（支持嵌套trace） */
     if (g_stopped_at_cross) {
         //目标函数没跑完，返回值没有意义：返回0，由调用方用原生执行的结果
         return 0;
@@ -432,15 +464,10 @@ bool checkAndCallHook(QBDI::VM *vm, QBDI::GPRState *gprState,size_t addr,size_t 
     return false;
 }
 
-/* 查找目标地址对应的jni trace回调 */
+/* 查找目标地址对应的jni trace回调（加锁查表，支持多线程同时trace） */
 static TraceFunc* findJniTraceFunc(size_t target)
 {
-    if(_g_jni_trace == nullptr)
-    {
-        return nullptr;
-    }
-    auto it = _g_jni_trace->map.find(target);
-    return it == _g_jni_trace->map.end() ? nullptr : it->second;
+    return findJNITraceEntry(target);
 }
 
 /* 查找目标地址对应的libc trace回调 */
@@ -497,44 +524,75 @@ static bool isArtModuleName(const char* path)
 }
 
 /* 调用信息头部:
- *  - 已hook的函数: "Call addr: "（不带换行，紧接着由回调输出 name(args)）
- *  - 未hook的函数: "Call addr: 0x地址 [模块!偏移]"
+ *  - 已hook的函数: "Call addr: 0x地址 [模块!偏移] "（不带换行，紧接着由回调输出 name(args)）
+ *  - 未hook的函数: "Call addr: 0x地址 [模块!偏移]"（带换行）
  */
+
+/*
+ * 目标地址 -> 模块信息缓存（thread_local）。
+ * 已hook的libc函数(memcpy/malloc...)调用量可能很大，每个调用都dladdr会很慢；
+ * 目标地址集合很小，缓存后只做哈希查找。
+ */
+struct CallHeadModInfo
+{
+    bool ok;
+    uint64_t off;
+    char mod[128];
+};
+
+static void lookupTargetModule(uint64_t target, bool &ok, char *mod, size_t modSize, uint64_t &off)
+{
+    static thread_local unordered_map<uint64_t, CallHeadModInfo> cache;
+    auto it = cache.find(target);
+    if (it == cache.end())
+    {
+        CallHeadModInfo info{};
+        Dl_info dl_info{};
+        info.ok = (target != 0 && dladdr((void*)target, &dl_info) != 0 &&
+                   dl_info.dli_fname != nullptr);
+        if (info.ok)
+        {
+            moduleShortName(dl_info.dli_fname, info.mod, sizeof(info.mod));
+            info.off = target - (uint64_t)dl_info.dli_fbase;
+        }
+        it = cache.emplace(target, info).first;
+    }
+    ok = it->second.ok;
+    off = it->second.off;
+    snprintf(mod, modSize, "%s", ok ? it->second.mod : "unknown");
+}
+
 static int buildCallHead(char* out, size_t size, uint64_t target, const char* hookName)
 {
     int off = 0;
-    if (hookName != nullptr)
-    {
-        return appf(out, size, off, "Call addr: ");
-    }
-
-    Dl_info info{};
-    bool ok = (target != 0 && dladdr((void*)target, &info) != 0 && info.dli_fname != nullptr);
+    bool ok = false;
+    uint64_t targetModOff = 0;
     char mod[128] = "unknown";
-    if (ok)
-    {
-        moduleShortName(info.dli_fname, mod, sizeof(mod));
-    }
+    lookupTargetModule(target, ok, mod, sizeof(mod), targetModOff);
 
+    //已hook和未hook的调用都先打印十六进制地址+模块内偏移，便于和指令行/IDA对照
     off = appf(out, size, off, "Call addr: 0x%" PRIx64, target);
     if (ok)
     {
-        //未hook的跨模块调用统一显示 [模块名!模块内偏移]
-        off = appf(out, size, off, " [%s!0x%" PRIx64 "]", mod, target - (uint64_t)info.dli_fbase);
+        off = appf(out, size, off, " [%s!0x%" PRIx64 "]", mod, targetModOff);
     }
     else
     {
         off = appf(out, size, off, " [unknown]");
     }
+
+    if (hookName != nullptr)
+    {
+        //已hook的函数: 地址之后留一个空格，回调紧接着输出 name(args)
+        off = appf(out, size, off, " ");
+        return off;
+    }
     off = appf(out, size, off, "\n");
     return off;
 }
 
-static size_t lastAddr = 0;
-
-/* 声明放在文件靠前，trace_call 里要用（定义在 showPreInstruction 上方） */
-
-static unordered_map<uint32_t,char*> disassemblecache;
+/* 反汇编缓存：按线程隔离，避免多线程 trace 同时 emplace 触发 unordered_map 竞争 */
+static thread_local unordered_map<uint32_t,char*> disassemblecache;
 
 // 显示指令执行前的寄存器状态
 QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::FPRState *fprState, void *data)
@@ -779,7 +837,8 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
 
     pending.valid = true;
 
-    if(sdslen(_logger->buf) > bufsize)
+    logger* cur = currentLogger();
+    if(cur != nullptr && sdslen(cur->buf) > bufsize)
     {
         writelog();
     }

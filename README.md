@@ -94,7 +94,11 @@ var res2 = vmCall(targetFunc, argsPtr, argNum, logPathPtr, 0x1000000A);
 
 * libnativelib.so 注入后不会自动trace，所有trace都由 lingyi_vm_call 触发
 * args 中的字符串/内存数据需要调用方提前分配好，参数最多8个（x0~x7）
-* JNI/libc trace环境只在首次调用时初始化，后续调用复用
+* JNI/libc trace环境只在首次调用时初始化，后续调用复用：
+  libc 地址->回调表只安装一次（`std::call_once` + 按地址查重）；
+  JNI 表每次 `lingyi_vm_call` 会按 JNIEnv 函数表**重新同步**（增量、已注册就跳过），
+  用于应对 JNIEnv 槽位在首次注册之后才被 patch/还原的情况，不会重复安装或丢失已有条目
+* `flags` 只对本次调用生效：进入时保存调用前配置，trace 结束恢复；传 0 表示沿用当前配置
 * inject.js 中已包含 prepareArgs、hook目标so、rpc调用等完整示例
 
 
@@ -108,12 +112,16 @@ var res2 = vmCall(targetFunc, argsPtr, argNum, logPathPtr, 0x1000000A);
 0x743584a838	0x7838		ldr	x1, [x1, #1384]	;X1=0x7482a19bd8 -> 0x7482652404
 0x743584a83c	0x783c		ldr	x8, [sp, #16]	;X8=0x744b07d200 -> 0x744b07ed18, SP=0x744b07d130
 0x743584a850	0x7850		blr	x8	;X8=0x7740f4d040, SP=0x744b07d130, LR=0x743585b884 -> 0x743584a854
-Call addr: malloc(0x80)
+Call addr: 0x7740f4d040 [libc.so!0x6d040] malloc(0x80)
        return x0 = 0x744b07ed10
 
 0x7435845bec	0x2bec		br	x17	;X17=0x7740f41540
-Call addr: strcmp("java/lang/Class", "java/lang/String")
+Call addr: 0x7740f41540 [libc.so!0x6d540] strcmp("java/lang/Class", "java/lang/String" [hex: 0d])
        return x0 = 0x13
+
+0x743584xxxx	0xxxx		blr	x8	;X8=0x7740f4xxxx
+Call addr: 0x7740f4xxxx [libc.so!0x6dxxx] memcpy(dst=0x6fab97e943, src="" [hex: 00 00], len=0x2, after="" [hex: 00 00])
+       return x0 = 0x6fab97e943
 
 0x7435845d10	0x2d10		svc	#0	;X8=0xde
   [SYSCALL] nr=222(0xde) x0=0x0 x1=0x1000 x2=0x3 x3=0x22 x4=0xffffffff x5=0x0
@@ -132,8 +140,11 @@ Call addr: 0x7740f31678 [libc.so!0x6d678]
 * 第1列：指令绝对地址；第2列：模块内偏移；第3列：反汇编
 * `;` 之后：写寄存器为 `before -> after`（值未变化时只输出一次），读寄存器输出当前值
 * `bl/blr` 会额外输出 `SP`（调用时栈指针）和 `LR`（`before -> after`，after即返回地址）
-* **已 hook 的函数**直接输出 `Call addr: 函数名(参数)`，下一行输出 `return x0 = ...`，
-  不再带原始地址，也不再输出 `Entering system lib` / `Return to`
+* **已 hook 的函数**输出 `Call addr: 0x地址 [模块名!偏移] 函数名(参数)`，下一行输出 `return x0 = 0x...`，
+  不再输出 `Entering system lib` / `Return to`
+* libc 字符串/缓冲区参数：能完整读到 C 字符串时输出 `"..."`；遇到 NUL 结尾会额外输出
+  `[hex: xx xx]`（例如 `src="" [hex: 00 00]`），二进制内容输出 `0x地址[hex bytes]`；
+  `memcpy/memmove` 还会在 `return x0` 之前输出 `after=`（复制完成后 dst 的实际字节预览）
 * **未 hook 的跨模块调用**输出 `Call addr: 0x地址 [模块名!偏移]`（能解析到符号时显示符号名），
   目标 so 内部的 `bl`/`blr`（含 PLT 前的本地跳转）只保留指令行
 * JNI 函数统一输出 `[JNI] 函数名(参数)`，下一行输出该函数的 C 原型，再输出 `obj/clazz` 解析出的

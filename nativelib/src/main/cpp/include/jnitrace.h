@@ -28,6 +28,8 @@ struct JNITraceMap {
 
 extern JNITraceMap* _g_jni_trace;
 void addJNITrace(void* target,const char* funcname,TraceCallBack callback);
+/* 加锁查 jni trace 表（多线程同时 trace 时用），未命中返回 nullptr */
+TraceFunc* findJNITraceEntry(size_t target);
 /* 重新注册trace表时静默(不打印"已注册"日志)，用于每次trace前的同步 */
 void setJNITraceQuiet(bool quiet);
 

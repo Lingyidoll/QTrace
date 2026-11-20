@@ -437,9 +437,9 @@ static bool checkSetup()
         LOGE("checkJniCall,pJFunc not init");
         return false;
     }
-    if(_logger == nullptr)
+    if(currentLogger() == nullptr)
     {
-        LOGE("checkJniCall,_logger not init");
+        LOGE("checkJniCall,logger not init");
         return false;
     }
     return true;
@@ -2439,12 +2439,16 @@ void setJNITraceQuiet(bool quiet)
 }
 
 /* 注册一个JNI trace地址(地址 -> 回调)，已注册过则跳过 */
+static std::mutex g_jni_trace_map_mutex;
+
 static void addJNITraceEntry(void* target, const char* funcname, TraceCallBack callback)
 {
     if (target == nullptr)
     {
         return;
     }
+    /* 支持多线程同时 trace：注册表是全局的，增量插入必须加锁 */
+    std::lock_guard<std::mutex> lk(g_jni_trace_map_mutex);
     auto it = _g_jni_trace->map.find((size_t)target);
     if (it != _g_jni_trace->map.end())
     {
@@ -2479,6 +2483,21 @@ void addJNITrace(void* target,const char* funcname,TraceCallBack callback)
     {
         addJNITraceEntry(target, funcname, callback);
     }
+}
+
+/*
+ * 加锁查表：多线程同时 trace 时，一个线程在 lingyi_vm_call 里增量注册，
+ * 另一个线程正在回调里查表，直接读 unordered_map 会有竞争。
+ */
+TraceFunc* findJNITraceEntry(size_t target)
+{
+    if (_g_jni_trace == nullptr)
+    {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lk(g_jni_trace_map_mutex);
+    auto it = _g_jni_trace->map.find(target);
+    return it == _g_jni_trace->map.end() ? nullptr : it->second;
 }
 
 void setup_jfunc(JNIEnv * jnienv)

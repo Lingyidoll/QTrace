@@ -16,56 +16,74 @@ static void addHooks()
 
 static void addLibctrace()
 {
-    void * handle = dlopen("libc.so",RTLD_LAZY);
-    if(handle == nullptr)
+    /*
+     * 库函数 trace 表只安装一次：
+     *  - std::call_once 保证多线程/多次进入 initTraceEnv 时也只有第一次真正注册；
+     *  - addLibctrace(handle,...) 内部还会按地址查重，所以即使别处再调一遍，
+     *    也只是打印 "already installed" 后跳过，不会覆盖已有回调、也不会泄漏 TraceFunc。
+     * 之前"每次trace都重装库函数钩子"的担心不会发生：trace_call 只做 QBDI 重放，
+     * 不会调用 initTraceEnv；表是全局的，后续调用直接复用。
+     */
+    static std::once_flag libc_trace_once;
+    std::call_once(libc_trace_once, []()
     {
-        LOGE("dlopen libc fail");
-        return;
-    }
-    addLibctrace(handle,libc_access,"access");
-    addLibctrace(handle,libc_system_property_get,"__system_property_get");
-    addLibctrace(handle,libc_memcpy,"memcpy");
-    addLibctrace(handle,libc_pthread_create,"pthread_create");
-    addLibctrace(handle,libc_fopen,"fopen");
-    addLibctrace(handle,libc_lstat,"lstat");
-    addLibctrace(handle,libc_stat,"stat");
-    addLibctrace(handle,libc_fstatat,"fstatat");
-    addLibctrace(handle,libc_execve,"execve");
-    addLibctrace(handle,libc_clock_gettime,"clock_gettime");
-    addLibctrace(handle,libc_strlen,"strlen");
-    addLibctrace(handle,libc_strcmp,"strcmp");
-    addLibctrace(handle,libc_memmove,"memmove");
-    addLibctrace(handle,libc_memset,"memset");
-    addLibctrace(handle,libc_kill,"kill");
-    addLibctrace(handle,libc_abort,"abort");
-    addLibctrace(handle,libc_exit,"exit");
-    addLibctrace(handle,libc_strncmp,"strncmp");
-    addLibctrace(handle,libc_strstr,"strstr");
-    addLibctrace(handle,libc_strcpy,"strcpy");
-    addLibctrace(handle,libc_strncpy,"strncpy");
-    addLibctrace(handle,libc_memcmp,"memcmp");
-    //常用内存/文件函数
-    addLibctrace(handle,libc_malloc,"malloc");
-    addLibctrace(handle,libc_free,"free");
-    addLibctrace(handle,libc_calloc,"calloc");
-    addLibctrace(handle,libc_realloc,"realloc");
-    addLibctrace(handle,libc_getenv,"getenv");
-    addLibctrace(handle,libc_open,"open");
-    addLibctrace(handle,libc_openat,"openat");
-    addLibctrace(handle,libc_read,"read");
-    addLibctrace(handle,libc_write,"write");
-    addLibctrace(handle,libc_close,"close");
-    //bionic内部实现，dlsym找不到时addLibctrace会回退到ELF动态符号表解析
-    addLibctrace(handle,libc_strlen,"__strlen_aarch64");
-    addLibctrace(handle,libc_memset,"__memset_aarch64");
-    //内存映射 / 动态符号 / 字符串复制
-    addLibctrace(handle,libc_mmap,"mmap");
-    addLibctrace(handle,libc_munmap,"munmap");
-    addLibctrace(handle,libc_dlsym,"dlsym");
-    addLibctrace(handle,libc_strdup,"strdup");
-    // todo pthread_mutex_lock
-    // todo pthread_mutex_unlock
-    dlclose(handle);
+        void * handle = dlopen("libc.so",RTLD_LAZY);
+        if(handle == nullptr)
+        {
+            LOGE("dlopen libc fail");
+            return;
+        }
+        addLibctrace(handle,libc_access,"access");
+        addLibctrace(handle,libc_system_property_get,"__system_property_get");
+        addLibctrace(handle,libc_memcpy,"memcpy");
+        addLibctrace(handle,libc_pthread_create,"pthread_create");
+        addLibctrace(handle,libc_fopen,"fopen");
+        addLibctrace(handle,libc_lstat,"lstat");
+        addLibctrace(handle,libc_stat,"stat");
+        addLibctrace(handle,libc_fstatat,"fstatat");
+        addLibctrace(handle,libc_execve,"execve");
+        addLibctrace(handle,libc_clock_gettime,"clock_gettime");
+        addLibctrace(handle,libc_strlen,"strlen");
+        addLibctrace(handle,libc_strcmp,"strcmp");
+        addLibctrace(handle,libc_memmove,"memmove");
+        addLibctrace(handle,libc_memset,"memset");
+        addLibctrace(handle,libc_kill,"kill");
+        addLibctrace(handle,libc_abort,"abort");
+        addLibctrace(handle,libc_exit,"exit");
+        addLibctrace(handle,libc_strncmp,"strncmp");
+        addLibctrace(handle,libc_strstr,"strstr");
+        addLibctrace(handle,libc_strcpy,"strcpy");
+        addLibctrace(handle,libc_strncpy,"strncpy");
+        addLibctrace(handle,libc_memcmp,"memcmp");
+        //常用内存/文件函数
+        addLibctrace(handle,libc_malloc,"malloc");
+        addLibctrace(handle,libc_free,"free");
+        addLibctrace(handle,libc_calloc,"calloc");
+        addLibctrace(handle,libc_realloc,"realloc");
+        addLibctrace(handle,libc_getenv,"getenv");
+        addLibctrace(handle,libc_open,"open");
+        addLibctrace(handle,libc_openat,"openat");
+        addLibctrace(handle,libc_read,"read");
+        addLibctrace(handle,libc_write,"write");
+        addLibctrace(handle,libc_close,"close");
+        //bionic内部实现，dlsym找不到时addLibctrace会回退到ELF动态符号表解析
+        addLibctrace(handle,libc_strlen,"__strlen_aarch64");
+        addLibctrace(handle,libc_memset,"__memset_aarch64");
+        //内存映射 / 动态符号 / 字符串复制
+        addLibctrace(handle,libc_mmap,"mmap");
+        addLibctrace(handle,libc_munmap,"munmap");
+        addLibctrace(handle,libc_dlsym,"dlsym");
+        addLibctrace(handle,libc_strdup,"strdup");
+        //线程同步函数
+        addLibctrace(handle,libc_pthread_mutex_lock,"pthread_mutex_lock");
+        addLibctrace(handle,libc_pthread_mutex_unlock,"pthread_mutex_unlock");
+        addLibctrace(handle,libc_pthread_rwlock_init,"pthread_rwlock_init");
+        addLibctrace(handle,libc_pthread_rwlock_unlock,"pthread_rwlock_unlock");
+
+        dlclose(handle);
+        LOGE("libc trace: %zu entries installed (once)",
+             _g_libc_trace != nullptr ? _g_libc_trace->map.size() : 0);
+    });
 }
 
 static void addJNItrace()
@@ -438,6 +456,16 @@ size_t lingyi_vm_call(void *func_addr, size_t *args, uint32_t arg_num, const cha
 {
     std::call_once(g_trace_init_flag, initTraceEnv);
 
+    /*
+     * 先保存"进入本次调用之前"的配置，再应用 flags。
+     * 注意必须在 setBufferSize(flags) 之前取：
+     * 旧代码是在应用 flags 之后才计算 savedConfig，结果保存下来的就是本次 flags，
+     * 于是 restore 等于没恢复 —— 上一次调用如果没带 bit1/bit3，后续 flags=0 的调用
+     * 就会一直沿用"jni/libc trace 关闭"的状态，表现为没有函数名/参数的 Call 行。
+     */
+    const uint32_t savedConfig = ((uint32_t)bufsize & 0xFFFFFF00u) |
+                                 ((uint32_t)bufstate & 0xFFu);
+
     if (flags != LINGYI_VM_FLAG_NONE)
     {
         /*
@@ -481,20 +509,32 @@ size_t lingyi_vm_call(void *func_addr, size_t *args, uint32_t arg_num, const cha
          is_jni_trace_enabled() ? 1 : 0,
          _g_jni_trace != nullptr ? _g_jni_trace->map.size() : 0,
          pJFunc != nullptr ? (void *)pJFunc->FindClass : nullptr);
+    /*
+     * libc trace表只在 initTraceEnv() 里安装一次，这里只打印当前状态，
+     * 不会重新注册/覆盖回调。如果这里的 entries 和首次安装时的数量一致，
+     * 就说明库函数钩子没有被重装，后续 trace 查表用的还是同一份地址->回调。
+     */
+    LOGE("lingyi_vm_call: libcTrace=%d, libcTraceEntries=%zu (installed once)",
+         is_libc_trace_enabled() ? 1 : 0,
+         _g_libc_trace != nullptr ? _g_libc_trace->map.size() : 0);
     if (!is_jni_trace_enabled())
     {
         LOGE("lingyi_vm_call: jni trace 未开启(flags低8位缺少bit1=0x2)，本次不会输出任何 [JNI] 行；"
              "需要JNI日志请传 0x1000000E(jni trace + 类名解析 + libc trace)");
     }
+    if (!is_libc_trace_enabled())
+    {
+        LOGE("lingyi_vm_call: libc trace 未开启(flags低8位缺少bit3=0x8)，"
+             "本次只会输出 \"Call addr: 0x...\" 而不会带函数名/参数；"
+             "需要libc日志请传 0x1000000E 或 0x1000000A");
+    }
 
-    //flags 是本次trace的临时覆盖：执行完恢复原配置，避免影响后续调用
-    const uint32_t savedConfig = ((uint32_t)bufsize & 0xFFFFFF00u) |
-                                 ((uint32_t)bufstate & 0xFFu);
+    //flags 是本次trace的临时覆盖：执行完恢复"调用前"的配置，避免影响后续调用
     size_t ret = trace_call(func_addr, args, arg_num, log_path);
     if (flags != LINGYI_VM_FLAG_NONE)
     {
         setBufferSize((int)savedConfig);
-        LOGI("lingyi_vm_call: restore config 0x%x", savedConfig);
+        LOGI("lingyi_vm_call: restore config 0x%x (from call-entry config)", savedConfig);
     }
     return ret;
 }
@@ -502,12 +542,13 @@ size_t lingyi_vm_call(void *func_addr, size_t *args, uint32_t arg_num, const cha
 /*
  * 能力版本号：frida 侧用它确认设备上 push 的是不是新版 so。
  *   v2 = getInstAnalysis 修复 + bit4(TRACE_CFG_STOP_BEFORE_ART 安全模式)
+ *   v3 = 支持同时/嵌套 trace 多个函数（去掉全局锁和同线程重入限制，状态按 trace 隔离）
  * 老 so 没有这个导出，脚本里 getExportByName 会直接抛错，从而避免"用旧 so 硬跑"再把 app 带崩。
  */
 extern "C" __attribute__((visibility("default")))
 int lingyi_vm_api_version(void)
 {
-    return 2;
+    return 3;
 }
 
 // no auto trace after injection, call lingyi_vm_call from frida
