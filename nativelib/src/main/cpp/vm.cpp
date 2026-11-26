@@ -524,68 +524,35 @@ static bool isArtModuleName(const char* path)
 }
 
 /* 调用信息头部:
- *  - 已hook的函数: "Call addr: 0x地址 [模块!偏移] "（不带换行，紧接着由回调输出 name(args)）
- *  - 未hook的函数: "Call addr: 0x地址 [模块!偏移]"（带换行）
+ *  - 已hook的函数: "Call addr: "（不带换行，紧接着由回调输出 name(args)）
+ *  - 未hook的函数: "Call addr: 0x地址 [模块!偏移]"
  */
-
-/*
- * 目标地址 -> 模块信息缓存（thread_local）。
- * 已hook的libc函数(memcpy/malloc...)调用量可能很大，每个调用都dladdr会很慢；
- * 目标地址集合很小，缓存后只做哈希查找。
- */
-struct CallHeadModInfo
-{
-    bool ok;
-    uint64_t off;
-    char mod[128];
-};
-
-static void lookupTargetModule(uint64_t target, bool &ok, char *mod, size_t modSize, uint64_t &off)
-{
-    static thread_local unordered_map<uint64_t, CallHeadModInfo> cache;
-    auto it = cache.find(target);
-    if (it == cache.end())
-    {
-        CallHeadModInfo info{};
-        Dl_info dl_info{};
-        info.ok = (target != 0 && dladdr((void*)target, &dl_info) != 0 &&
-                   dl_info.dli_fname != nullptr);
-        if (info.ok)
-        {
-            moduleShortName(dl_info.dli_fname, info.mod, sizeof(info.mod));
-            info.off = target - (uint64_t)dl_info.dli_fbase;
-        }
-        it = cache.emplace(target, info).first;
-    }
-    ok = it->second.ok;
-    off = it->second.off;
-    snprintf(mod, modSize, "%s", ok ? it->second.mod : "unknown");
-}
-
 static int buildCallHead(char* out, size_t size, uint64_t target, const char* hookName)
 {
     int off = 0;
-    bool ok = false;
-    uint64_t targetModOff = 0;
-    char mod[128] = "unknown";
-    lookupTargetModule(target, ok, mod, sizeof(mod), targetModOff);
+    if (hookName != nullptr)
+    {
+        //已hook的函数只输出 "Call addr: "，函数名/参数由回调紧接着输出
+        return appf(out, size, off, "Call addr: ");
+    }
 
-    //已hook和未hook的调用都先打印十六进制地址+模块内偏移，便于和指令行/IDA对照
+    Dl_info info{};
+    bool ok = (target != 0 && dladdr((void*)target, &info) != 0 && info.dli_fname != nullptr);
+    char mod[128] = "unknown";
+    if (ok)
+    {
+        moduleShortName(info.dli_fname, mod, sizeof(mod));
+    }
+
     off = appf(out, size, off, "Call addr: 0x%" PRIx64, target);
     if (ok)
     {
-        off = appf(out, size, off, " [%s!0x%" PRIx64 "]", mod, targetModOff);
+        //未hook的跨模块调用统一显示 [模块名!模块内偏移]
+        off = appf(out, size, off, " [%s!0x%" PRIx64 "]", mod, target - (uint64_t)info.dli_fbase);
     }
     else
     {
         off = appf(out, size, off, " [unknown]");
-    }
-
-    if (hookName != nullptr)
-    {
-        //已hook的函数: 地址之后留一个空格，回调紧接着输出 name(args)
-        off = appf(out, size, off, " ");
-        return off;
     }
     off = appf(out, size, off, "\n");
     return off;

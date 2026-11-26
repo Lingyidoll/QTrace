@@ -144,11 +144,8 @@ static void appendHexBytes(const uint8_t* buf, uint64_t n, uint64_t maxBytes)
 }
 
 /*
- * 追加缓冲区预览：
- *  - 内容全是可打印字符: 输出 "字符串"；
- *  - 字符串里出现 NUL 结尾: 额外输出 [hex: xx xx]，这样 len=2 的 00 00
- *    不会只显示成 ""（看不出实际字节）；
- *  - 二进制/不可读: 输出 0x地址[hex bytes]。
+ * 追加缓冲区预览：无论内容是不是可打印字符串，都先输出 0x地址[hex bytes]；
+ * 如果内容确实是可打印字符串，再在末尾附上 "字符串" 方便阅读。
  */
 static void appendBufferPreview(uint64_t addr, uint64_t len, uint64_t maxLen)
 {
@@ -173,15 +170,20 @@ static void appendBufferPreview(uint64_t addr, uint64_t len, uint64_t maxLen)
         appendformat("0x%lx", addr);
         return;
     }
+
+    //统一输出十六进制内容
+    appendformat("0x%lx[", addr);
+    appendHexBytes(buf, n, 64);
+    appendlog("]");
+
+    //可打印时额外附上字符串（遇到NUL为止），二进制内容不附加
     bool printable = true;
     uint64_t textLen = n;
-    bool terminated = false;
     for (uint64_t i = 0; i < n; ++i)
     {
         if (buf[i] == 0)
         {
             textLen = i;
-            terminated = true;
             break;
         }
         if (buf[i] < 0x20 || buf[i] > 0x7e)
@@ -190,24 +192,11 @@ static void appendBufferPreview(uint64_t addr, uint64_t len, uint64_t maxLen)
             break;
         }
     }
-    if (printable)
+    if (printable && textLen > 0)
     {
-        appendlog("\"");
+        appendlog(" \"");
         appendlog_n((const char*)buf, (size_t)textLen);
         appendlog("\"");
-        if (terminated)
-        {
-            //把字符串结尾(含 NUL)的真实字节用hex补上，空字符串也能看到 00
-            appendlog(" [hex: ");
-            appendHexBytes(buf, textLen + 1, 16);
-            appendlog("]");
-        }
-    }
-    else
-    {
-        appendformat("0x%lx[", addr);
-        appendHexBytes(buf, n, 64);
-        appendlog("]");
     }
 }
 
@@ -308,14 +297,7 @@ void libc_memmove(QBDI::VM *vm, QBDI::GPRState *gprState)
     }
     appendformat("memmove(dst=0x%lx, src=", x0);
     appendBufferPreview(x1, x2, 32);
-    appendformat(", len=0x%lx", x2);
-    //回调在调用返回之后执行，返回值x0就是dst，此时可以读到搬运后的内容
-    if ((uint64_t)g_deferred_call_retval == x0)
-    {
-        appendlog(", after=");
-        appendBufferPreview(x0, x2, 16);
-    }
-    appendlog(")");
+    appendformat(", len=0x%lx)", x2);
     appendlogendl();
 }
 
@@ -344,14 +326,7 @@ void libc_memcpy(QBDI::VM *vm, QBDI::GPRState *gprState)
     uint64_t x2 = QBDI_GPR_GET(gprState, 2);
     appendformat("memcpy(dst=0x%lx, src=", x0);
     appendBufferPreview(x1, x2, 32);
-    appendformat(", len=0x%lx", x2);
-    //回调在调用返回之后执行，返回值x0就是dst，此时可以读到复制后的内容
-    if ((uint64_t)g_deferred_call_retval == x0)
-    {
-        appendlog(", after=");
-        appendBufferPreview(x0, x2, 16);
-    }
-    appendlog(")");
+    appendformat(", len=0x%lx)", x2);
     appendlogendl();
 }
 

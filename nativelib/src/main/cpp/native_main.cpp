@@ -79,7 +79,7 @@ static void addLibctrace()
         addLibctrace(handle,libc_pthread_mutex_unlock,"pthread_mutex_unlock");
         addLibctrace(handle,libc_pthread_rwlock_init,"pthread_rwlock_init");
         addLibctrace(handle,libc_pthread_rwlock_unlock,"pthread_rwlock_unlock");
-
+        // todo gettimeofday
         dlclose(handle);
         LOGE("libc trace: %zu entries installed (once)",
              _g_libc_trace != nullptr ? _g_libc_trace->map.size() : 0);
